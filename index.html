@@ -25,6 +25,7 @@
   ║  top of the <script> block. Adjust:                      ║
   ║    - colors for theming                                  ║
   ║    - player.speed for movement responsiveness            ║
+  ║    - player.shotCooldown for delay between shots (ms)    ║
   ║    - difficulty.* for game balance                       ║
   ║    - toggles.* to enable/disable features                ║
   ║                                                          ║
@@ -81,8 +82,7 @@
 const CONFIG = {
   canvas: { width: 480, height: 800, scaleToFit: true },
   colors: {
-    bg: '#0a0a0f',
-    gridLines: '#1a1a24',
+    bg: '#020208',
     player: '#00f0ff',
     playerBullet: '#00f0ff',
     enemyBasic: '#ff4a6d',
@@ -92,16 +92,27 @@ const CONFIG = {
     particles: ['#ffffff', '#00f0ff', '#ff4a6d', '#f5a623'],
     accent: '#00f0ff'
   },
-  player: { speed: 5, lives: 3, shootCooldown: 20, respawnInvuln: 1500 },
-  bullets: { playerSpeed: 12, enemySpeed: 4, playerRadius: 4, enemyRadius: 5 },
+  player: { speed: 5, lives: 3, maxPlayerBullets: 2, respawnInvuln: 3000, shotCooldown: 200 },
+  bullets: { playerSpeed: 15, enemySpeed: 12, playerRadius: 4, enemyRadius: 5 },
   enemies: {
     formationSpeed: 0.03,
     diveFrequency: 0.008,
-    returnSpeed: 2,
+    returnSpeed: 3,
     health: { basic: 1, zigzag: 2, turret: 3 },
     shootChance: { basic: 0.02, zigzag: 0.03, turret: 0.08 }
   },
   particles: { countOnDeath: 18, speedRange: [1, 4], lifetime: 40, fadeRate: 0.025 },
+  stars: {
+    count: 200,              // total number of stars in the field
+    speed: 0.5,              // base downward scroll speed (pixels per frame)
+    speedVariation: 1.5,     // additional random speed per star (0..value)
+    minSize: 0.5,            // smallest star radius
+    maxSize: 2.5,            // largest star radius
+    flickerSpeed: 0.06,      // base flicker frequency multiplier
+    flickerVariation: 0.08,  // per-star flicker randomness
+    minAlpha: 0.15,          // dimmest star brightness
+    maxAlpha: 1.0            // brightest star brightness
+  },
   audio: {
     shoot: 'sounds/shoot.wav',
     hit: 'sounds/hit.wav',
@@ -335,11 +346,13 @@ let player = null;
 let bullets = [];
 let enemies = [];
 let particles = [];
+let stars = [];
 let waveManager = null;
 let score = 0;
 let highScore = parseInt(localStorage.getItem('galaga_highscore')) || 0;
 let lastTime = 0;
 let globalTime = 0;
+let lastShotTime = 0;
 
 // --- Player ---
 function createPlayer() {
@@ -349,7 +362,6 @@ function createPlayer() {
     width: 28,
     height: 32,
     lives: CONFIG.player.lives,
-    shootTimer: 0,
     invulnTimer: 0,
     alive: true
   };
@@ -476,8 +488,12 @@ function updateFormationPositions() {
     if (e.state !== 'formation') return;
     // Row-based phase offset: upper rows sway slightly differently
     const rowOffset = e.gridY * 0.3;
-    e.x = e.targetX + swayAmount * swayPhase * (1 + rowOffset * 0.1);
-    e.y = e.targetY;
+    const targetX = e.targetX + swayAmount * swayPhase * (1 + rowOffset * 0.1);
+    const targetY = e.targetY;
+    // Smoothly interpolate toward sway-adjusted target to prevent snapping
+    // when enemies transition from 'returning' to 'formation'
+    e.x += (targetX - e.x) * 0.15;
+    e.y += (targetY - e.y) * 0.15;
   });
 }
 
@@ -603,19 +619,14 @@ function updateDivingEnemies() {
       const chanceMap = CONFIG.enemies.shootChance;
       const diffMult = getDifficultyMultiplier(waveManager.wave);
       if (Math.random() < chanceMap[e.type] * 2 * diffMult) { // Higher chance during dive, scales with difficulty
-        const dx = player.x - e.x;
-        const dy = player.y - e.y;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        if (dist > 0) {
-          const speed = CONFIG.bullets.enemySpeed * Math.min(diffMult, 2.0); // Cap bullet speed at 2x
-          bullets.push(createBullet(
-            e.x, e.y + 10,
-            (dx / dist) * speed,
-            (dy / dist) * speed,
-            'enemy',
-            CONFIG.bullets.enemyRadius
-          ));
-        }
+        const speed = CONFIG.bullets.enemySpeed * Math.min(diffMult, 2.0); // Cap bullet speed at 2x
+        bullets.push(createBullet(
+          e.x, e.y + 10,
+          0,
+          speed,
+          'enemy',
+          CONFIG.bullets.enemyRadius
+        ));
       }
       e.shootTimer = Math.max(10, 30 + Math.random() * 60 - waveManager.wave * 2); // Fire faster at higher waves
     }
@@ -639,8 +650,7 @@ function updateReturningEnemies() {
     const dist = Math.sqrt(dx * dx + dy * dy);
     if (dist < 3) {
       e.state = 'formation';
-      e.x = e.targetX;
-      e.y = e.targetY;
+      // Do NOT snap position — let formation sway take over smoothly
       return;
     }
     const speed = CONFIG.enemies.returnSpeed;
@@ -798,26 +808,61 @@ function updateParticles() {
 //  DRAWING FUNCTIONS
 // ================================================================
 
-/** Background with subtle grid lines */
+/** Initialize the starfield — called once at startup */
+function initStars() {
+  const sc = CONFIG.stars;
+  stars = [];
+  for (let i = 0; i < sc.count; i++) {
+    const size = sc.minSize + Math.random() * (sc.maxSize - sc.minSize);
+    stars.push({
+      x: Math.random() * W,
+      y: Math.random() * H,
+      size: size,
+      // Larger stars scroll faster (parallax depth effect)
+      speed: sc.speed + Math.random() * sc.speedVariation * (size / sc.maxSize),
+      // Each star gets its own flicker phase and frequency so they never sync
+      phase: Math.random() * Math.PI * 2,
+      flickerRate: sc.flickerSpeed + Math.random() * sc.flickerVariation,
+      // Base brightness — larger stars tend to be brighter
+      baseAlpha: sc.minAlpha + Math.random() * (sc.maxAlpha - sc.minAlpha)
+    });
+  }
+}
+
+/** Update star positions — scroll downward and wrap */
+function updateStars() {
+  for (let i = 0; i < stars.length; i++) {
+    const s = stars[i];
+    s.y += s.speed;
+    s.phase += s.flickerRate;
+    // Wrap star back to top when it leaves the bottom
+    if (s.y > H + s.size) {
+      s.y = -s.size;
+      s.x = Math.random() * W;
+    }
+  }
+}
+
+/** Draw the starfield background */
 function drawBackground() {
   c.fillStyle = CONFIG.colors.bg;
   c.fillRect(0, 0, W, H);
 
-  // Subtle grid
-  c.strokeStyle = CONFIG.colors.gridLines;
-  c.lineWidth = 0.5;
-  const gridSize = 40;
-  for (let x = 0; x <= W; x += gridSize) {
+  // Draw each star as a small glowing dot with independent flicker
+  for (let i = 0; i < stars.length; i++) {
+    const s = stars[i];
+    // Natural flicker: sine wave modulates alpha around baseAlpha
+    const flicker = Math.sin(s.phase) * 0.5 + 0.5; // 0..1
+    const alpha = s.baseAlpha * (0.4 + flicker * 0.6);
+    c.save();
+    c.globalAlpha = Math.max(0.05, Math.min(1, alpha));
+    c.fillStyle = '#ffffff';
+    c.shadowColor = '#ffffff';
+    c.shadowBlur = s.size * 2;
     c.beginPath();
-    c.moveTo(x, 0);
-    c.lineTo(x, H);
-    c.stroke();
-  }
-  for (let y = 0; y <= H; y += gridSize) {
-    c.beginPath();
-    c.moveTo(0, y);
-    c.lineTo(W, y);
-    c.stroke();
+    c.arc(s.x, s.y, s.size, 0, Math.PI * 2);
+    c.fill();
+    c.restore();
   }
 }
 
@@ -1283,6 +1328,7 @@ function startGame() {
   waveManager = createWaveManager();
   spawnWave(waveManager);
   globalTime = 0;
+  lastShotTime = 0;
 }
 
 // ================================================================
@@ -1296,17 +1342,20 @@ function gameLoop(timestamp) {
   lastTime = timestamp;
 
   if (gameState === STATE.MENU) {
+    updateStars();
     drawMenu();
     return;
   }
 
   if (gameState === STATE.GAME_OVER) {
+    updateStars();
     drawGameOver();
     updateParticles();
     return;
   }
 
   if (gameState === STATE.PAUSED) {
+    updateStars();
     // Still render the game underneath
     drawBackground();
     drawEnemies();
@@ -1331,19 +1380,22 @@ function gameLoop(timestamp) {
     // Invulnerability timer
     if (player.invulnTimer > 0) player.invulnTimer -= dt * 1000;
 
-    // Shooting
-    if (player.shootTimer > 0) player.shootTimer -= 1;
-    if (shootPressed && player.shootTimer <= 0) {
-      bullets.push(createBullet(
-        player.x,
-        player.y - player.height / 2,
-        0,
-        -CONFIG.bullets.playerSpeed,
-        'player',
-        CONFIG.bullets.playerRadius
-      ));
-      player.shootTimer = CONFIG.player.shootCooldown;
-      AudioSys.play('shoot');
+    // Shooting — limited by number of player bullets on screen (priority) and per-shot cooldown
+    if (shootPressed) {
+      const playerBulletCount = bullets.filter(b => b.alive && b.type === 'player').length;
+      const timeSinceLastShot = globalTime * 1000 - lastShotTime;
+      if (playerBulletCount < CONFIG.player.maxPlayerBullets && timeSinceLastShot >= CONFIG.player.shotCooldown) {
+        bullets.push(createBullet(
+          player.x,
+          player.y - player.height / 2,
+          0,
+          -CONFIG.bullets.playerSpeed,
+          'player',
+          CONFIG.bullets.playerRadius
+        ));
+        AudioSys.play('shoot');
+        lastShotTime = globalTime * 1000;
+      }
     }
   }
 
@@ -1391,6 +1443,9 @@ function gameLoop(timestamp) {
   // --- Collisions ---
   checkCollisions();
 
+  // --- Stars ---
+  updateStars();
+
   // --- Particles ---
   updateParticles();
 
@@ -1407,6 +1462,7 @@ function gameLoop(timestamp) {
 //  BOOTSTRAP — Start the loop
 // ================================================================
 (function boot() {
+  initStars();
   requestAnimationFrame(gameLoop);
 })();
 </script>

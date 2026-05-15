@@ -1,0 +1,1414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Galaga Clone</title>
+
+<!--
+  ╔══════════════════════════════════════════════════════════╗
+  ║              GALAGA CLONE — README                       ║
+  ╠══════════════════════════════════════════════════════════╣
+  ║                                                          ║
+  ║  AUDIO FILES:                                            ║
+  ║  Place .wav files in a "sounds/" folder next to this     ║
+  ║  file. Expected filenames (configurable in CONFIG.audio): ║
+  ║    - sounds/shoot.wav       (player fires)               ║
+  ║    - sounds/hit.wav         (enemy hit)                  ║
+  ║    - sounds/explosion.wav   (enemy destroyed)            ║
+  ║    - sounds/levelup.wav     (wave cleared)               ║
+  ║    - sounds/gameover.wav    (game over)                  ║
+  ║  Audio gracefully degrades if files are missing.         ║
+  ║                                                          ║
+  ║  CONFIG TWEAKING:                                        ║
+  ║  All tunable values live in the CONFIG object at the     ║
+  ║  top of the <script> block. Adjust:                      ║
+  ║    - colors for theming                                  ║
+  ║    - player.speed for movement responsiveness            ║
+  ║    - difficulty.* for game balance                       ║
+  ║    - toggles.* to enable/disable features                ║
+  ║                                                          ║
+  ║  TOUCH INPUT:                                            ║
+  ║    - Drag anywhere on canvas to move player proportionally║
+  ║    - Tap/click to shoot (ignores drag state)             ║
+  ║    - Double-tap top-center area to pause/resume          ║
+  ║    - Multi-touch supported (primary finger moves,        ║
+  ║      secondary taps fire)                                ║
+  ║                                                          ║
+  ║  CONTROLS:                                               ║
+  ║    - Arrow keys / WASD: move                             ║
+  ║    - Space: shoot (hold for auto-fire)                   ║
+  ║    - P / ESC: pause/resume                               ║
+  ╚══════════════════════════════════════════════════════════╝
+-->
+
+<style>
+  *, *::before, *::after {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+  }
+
+  html, body {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #000;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    touch-action: none;
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  canvas {
+    display: block;
+    object-fit: contain;
+    margin: auto;
+    image-rendering: auto;
+  }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+
+<script>
+// ================================================================
+//  CONFIG — Centralized game parameters. Change here only.
+// ================================================================
+const CONFIG = {
+  canvas: { width: 480, height: 800, scaleToFit: true },
+  colors: {
+    bg: '#0a0a0f',
+    gridLines: '#1a1a24',
+    player: '#00f0ff',
+    playerBullet: '#00f0ff',
+    enemyBasic: '#ff4a6d',
+    enemyZigzag: '#f5a623',
+    enemyTurret: '#b088f9',
+    enemyBullet: '#ff4a6d',
+    particles: ['#ffffff', '#00f0ff', '#ff4a6d', '#f5a623'],
+    accent: '#00f0ff'
+  },
+  player: { speed: 5, lives: 3, shootCooldown: 20, respawnInvuln: 1500 },
+  bullets: { playerSpeed: 12, enemySpeed: 4, playerRadius: 4, enemyRadius: 5 },
+  enemies: {
+    formationSpeed: 0.03,
+    diveFrequency: 0.008,
+    returnSpeed: 2,
+    health: { basic: 1, zigzag: 2, turret: 3 },
+    shootChance: { basic: 0.02, zigzag: 0.03, turret: 0.08 }
+  },
+  particles: { countOnDeath: 18, speedRange: [1, 4], lifetime: 40, fadeRate: 0.025 },
+  audio: {
+    shoot: 'sounds/shoot.wav',
+    hit: 'sounds/hit.wav',
+    explosion: 'sounds/explosion.wav',
+    levelUp: 'sounds/levelup.wav',
+    gameOver: 'sounds/gameover.wav',
+    volume: 0.6,
+    enabled: true
+  },
+  toggles: { particles: true, highScore: true, mobileControls: true },
+  difficulty: { scorePerKill: 100, wavesToProgress: 3, maxWave: 20 }
+};
+
+// ================================================================
+//  AUDIO SYSTEM — Web Audio API with silent fallback
+// ================================================================
+const AudioSys = (() => {
+  let ctx = null;
+  const buffers = {};
+
+  /** Initialize AudioContext on first user gesture (browser policy) */
+  function init() {
+    if (ctx) return;
+    try {
+      ctx = new (window.AudioContext || window.webkitAudioContext)();
+    } catch (e) {
+      // Audio not supported — game continues silently
+      return;
+    }
+    // Preload all audio files now that context is ready
+    if (CONFIG.audio.enabled) {
+      Object.keys(CONFIG.audio)
+        .filter(k => k !== 'volume' && k !== 'enabled')
+        .forEach(key => preload(CONFIG.audio[key]));
+    }
+  }
+
+  /** Preload a WAV file and cache its decoded buffer */
+  function preload(url) {
+    if (!CONFIG.audio.enabled || !ctx) return Promise.resolve(null);
+    if (buffers[url]) return Promise.resolve(buffers[url]);
+    return fetch(url)
+      .then(r => r.arrayBuffer())
+      .then(ab => ctx.decodeAudioData(ab))
+      .then(buf => { buffers[url] = buf; return buf; })
+      .catch(() => { buffers[url] = null; return null; }); // Silent fallback
+  }
+
+  /** Play a preloaded sound buffer */
+  function play(soundKey) {
+    if (!CONFIG.audio.enabled || !ctx) return;
+    const buf = buffers[soundKey];
+    if (!buf) return;
+    try {
+      const source = ctx.createBufferSource();
+      source.buffer = buf;
+      const gain = ctx.createGain();
+      gain.gain.value = CONFIG.audio.volume;
+      source.connect(gain);
+      gain.connect(ctx.destination);
+      source.start(0);
+    } catch (e) { /* degrade silently */ }
+  }
+
+  return { init, preload, play };
+})();
+
+// ================================================================
+//  CANVAS SETUP — Responsive, maintains 3:2 aspect ratio
+// ================================================================
+const canvas = document.getElementById('gameCanvas');
+const c = canvas.getContext('2d');
+const W = CONFIG.canvas.width;
+const H = CONFIG.canvas.height;
+
+canvas.width = W;
+canvas.height = H;
+
+/** Scale canvas to fit the viewport while preserving aspect ratio */
+function resizeCanvas() {
+  if (!CONFIG.canvas.scaleToFit) return;
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const scale = Math.min(vw / W, vh / H);
+  canvas.style.width = (W * scale) + 'px';
+  canvas.style.height = (H * scale) + 'px';
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+/** Convert screen/touch coordinates to canvas logical coordinates */
+function toCanvasX(clientX) {
+  const rect = canvas.getBoundingClientRect();
+  return ((clientX - rect.left) / rect.width) * W;
+}
+function toCanvasY(clientY) {
+  const rect = canvas.getBoundingClientRect();
+  return ((clientY - rect.top) / rect.height) * H;
+}
+
+// ================================================================
+//  STATE MACHINE
+// ================================================================
+const STATE = { MENU: 0, PLAYING: 1, PAUSED: 2, GAME_OVER: 3 };
+let gameState = STATE.MENU;
+
+// ================================================================
+//  INPUT SYSTEM — Keyboard + Touch/Mouse
+// ================================================================
+const keys = {};
+let touchState = { active: false, startX: 0, startY: 0, lastX: 0, lastY: 0 };
+let shootPressed = false;
+
+document.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code === 'Space') { e.preventDefault(); shootPressed = true; }
+  if (e.code === 'KeyP' || e.code === 'Escape') {
+    if (gameState === STATE.PLAYING) gameState = STATE.PAUSED;
+    else if (gameState === STATE.PAUSED) gameState = STATE.PLAYING;
+  }
+  // Start game on Space or Enter from menu/gameover
+  if (gameState === STATE.MENU || gameState === STATE.GAME_OVER) {
+    if (e.code === 'Space' || e.code === 'Enter') {
+      AudioSys.init();
+      startGame();
+    }
+  }
+});
+document.addEventListener('keyup', e => {
+  keys[e.code] = false;
+  if (e.code === 'Space') shootPressed = false;
+});
+
+// Touch handling
+canvas.addEventListener('touchstart', handleTouchStart, { passive: false });
+canvas.addEventListener('touchmove', handleTouchMove, { passive: false });
+canvas.addEventListener('touchend', handleTouchEnd, { passive: false });
+canvas.addEventListener('mousedown', handleMouseDown);
+canvas.addEventListener('mouseup', handleMouseUp);
+canvas.addEventListener('mousemove', handleMouseMove);
+
+let mouseDown = false;
+let mouseTouchState = null;
+
+function handleMouseDown(e) {
+  AudioSys.init();
+  if (gameState === STATE.MENU || gameState === STATE.GAME_OVER) { startGame(); return; }
+  if (gameState === STATE.PAUSED) { gameState = STATE.PLAYING; return; }
+  mouseDown = true;
+  const cx = toCanvasX(e.clientX);
+  const cy = toCanvasY(e.clientY);
+  mouseTouchState = { active: true, lastX: cx, lastY: cy };
+  shootPressed = true;
+  // Double-tap pause zone: top-center
+  if (cy < 80) togglePauseTouch();
+}
+
+function handleMouseUp() {
+  mouseDown = false;
+  mouseTouchState = null;
+  shootPressed = false;
+}
+
+function handleMouseMove(e) {
+  if (!mouseDown || !mouseTouchState || gameState !== STATE.PLAYING) return;
+  const cx = toCanvasX(e.clientX);
+  const cy = toCanvasY(e.clientY);
+  if (player) {
+    player.x += (cx - mouseTouchState.lastX);
+    // Vertical movement disabled
+    clampPlayer();
+  }
+  mouseTouchState.lastX = cx;
+  mouseTouchState.lastY = cy;
+}
+
+function handleTouchStart(e) {
+  e.preventDefault();
+  AudioSys.init();
+  if (gameState === STATE.MENU || gameState === STATE.GAME_OVER) { startGame(); return; }
+  // Double-tap detection for pause
+  const now = Date.now();
+  if (e.touches.length > 0) {
+    const ty = toCanvasY(e.touches[0].clientY);
+    if (ty < 80 && now - lastTapTime < 300) { togglePauseTouch(); }
+    lastTapTime = now;
+  }
+  touchState.active = true;
+  const first = e.touches[0];
+  touchState.startX = toCanvasX(first.clientX);
+  touchState.startY = toCanvasY(first.clientY);
+  touchState.lastX = touchState.startX;
+  touchState.lastY = touchState.startY;
+  shootPressed = true;
+}
+
+function handleTouchMove(e) {
+  e.preventDefault();
+  if (!touchState.active || gameState !== STATE.PLAYING || !player) return;
+  const first = e.touches[0];
+  const cx = toCanvasX(first.clientX);
+  const cy = toCanvasY(first.clientY);
+  player.x += (cx - touchState.lastX);
+  // Vertical movement disabled
+  clampPlayer();
+  touchState.lastX = cx;
+  touchState.lastY = cy;
+  // Additional touches fire
+  if (e.touches.length > 1) shootPressed = true;
+}
+
+function handleTouchEnd(e) {
+  e.preventDefault();
+  touchState.active = false;
+  if (e.touches.length === 0) shootPressed = false;
+  else shootPressed = true; // Keep firing if other fingers down
+}
+
+let lastTapTime = 0;
+function togglePauseTouch() {
+  if (gameState === STATE.PLAYING) gameState = STATE.PAUSED;
+  else if (gameState === STATE.PAUSED) gameState = STATE.PLAYING;
+}
+
+// ================================================================
+//  GAME ENTITIES
+// ================================================================
+let player = null;
+let bullets = [];
+let enemies = [];
+let particles = [];
+let waveManager = null;
+let score = 0;
+let highScore = parseInt(localStorage.getItem('galaga_highscore')) || 0;
+let lastTime = 0;
+let globalTime = 0;
+
+// --- Player ---
+function createPlayer() {
+  return {
+    x: W / 2,
+    y: H - 80,
+    width: 28,
+    height: 32,
+    lives: CONFIG.player.lives,
+    shootTimer: 0,
+    invulnTimer: 0,
+    alive: true
+  };
+}
+
+function clampPlayer() {
+  if (!player) return;
+  player.x = Math.max(player.width / 2, Math.min(W - player.width / 2, player.x));
+  player.y = Math.max(player.height / 2, Math.min(H - player.height / 2, player.y));
+}
+
+// --- Bullet ---
+function createBullet(x, y, vx, vy, type, radius) {
+  return { x, y, vx, vy, type, radius: radius || 4, alive: true };
+}
+
+// --- Enemy ---
+function createEnemy(type, gridX, gridY, formationX, formationY) {
+  const hpMap = CONFIG.enemies.health;
+  return {
+    type, // 'basic', 'zigzag', 'turret'
+    x: formationX,
+    y: formationY,
+    gridX,
+    gridY,
+    hp: hpMap[type] || 1,
+    maxHp: hpMap[type] || 1,
+    state: 'formation', // 'formation', 'diving', 'returning'
+    diveTimer: 0,
+    divePhase: 0,
+    alive: true,
+    shootTimer: Math.random() * 100,
+    // For dive paths
+    divePath: [],
+    divePathIndex: 0,
+    diveStartTime: 0,
+    // For return
+    targetX: formationX,
+    targetY: formationY
+  };
+}
+
+// --- Particle ---
+function createParticle(x, y, vx, vy, color, life, size) {
+  return { x, y, vx, vy, color, life, maxLife: life, size, alive: true };
+}
+
+// ================================================================
+//  WAVE MANAGER — Spawns enemies, tracks progression
+// ================================================================
+function createWaveManager() {
+  return {
+    wave: 1,
+    enemiesSpawned: 0,
+    enemiesInWave: 0,
+    waveComplete: false,
+    timer: 0,
+    spawnPhase: 0
+  };
+}
+
+/** Get the grid dimensions for the current wave */
+function getWaveLayout(wave) {
+  const cols = Math.min(8, 5 + Math.floor(wave / 3));
+  const rows = Math.min(5, 2 + Math.floor(wave / 4));
+  return { cols, rows };
+}
+
+/** Difficulty multiplier that scales with wave number */
+function getDifficultyMultiplier(wave) {
+  return 1 + (wave - 1) * 0.15;  // 15% harder per wave
+}
+
+/** Spawn a full wave of enemies in grid formation */
+function spawnWave(wm) {
+  const { cols, rows } = getWaveLayout(wm.wave);
+  const spacingX = (W - 80) / (cols + 1);
+  const spacingY = 70;
+  const startY = 60;
+  const difficulty = getDifficultyMultiplier(wm.wave);
+
+  enemies = [];
+
+  for (let r = 0; r < rows; r++) {
+    for (let col = 0; col < cols; col++) {
+      let type = 'basic';
+      // Introduce harder enemies more frequently as waves progress
+      const roll = Math.random();
+      const turretChance = Math.min(0.5, 0.10 + wm.wave * 0.04);
+      const zigzagChance = Math.min(0.6, 0.25 + wm.wave * 0.05);
+      if (roll < turretChance) type = 'turret';
+      else if (roll < turretChance + zigzagChance) type = 'zigzag';
+
+      const fx = 40 + col * spacingX + spacingX / 2;
+      const fy = startY + r * spacingY;
+      const enemy = createEnemy(type, col, r, fx, fy);
+      // Scale HP with difficulty
+      enemy.hp = Math.ceil(enemy.hp * difficulty);
+      enemy.maxHp = enemy.hp;
+      enemies.push(enemy);
+    }
+  }
+
+  wm.enemiesInWave = enemies.length;
+  wm.enemiesSpawned = 0;
+  wm.waveComplete = false;
+}
+
+// ================================================================
+//  FORMATION SWAY & DIVE SYSTEM
+// ================================================================
+
+/**
+ * Formation sway: enemies oscillate horizontally as a group.
+ * Uses Math.sin(globalTime * CONFIG.enemies.formationSpeed) for smooth
+ * sinusoidal movement. Each row can have a slight phase offset for
+ * a more organic feel.
+ */
+function updateFormationPositions() {
+  const swayAmount = 30;
+  const swayPhase = Math.sin(globalTime * CONFIG.enemies.formationSpeed);
+
+  enemies.forEach(e => {
+    if (e.state !== 'formation') return;
+    // Row-based phase offset: upper rows sway slightly differently
+    const rowOffset = e.gridY * 0.3;
+    e.x = e.targetX + swayAmount * swayPhase * (1 + rowOffset * 0.1);
+    e.y = e.targetY;
+  });
+}
+
+/**
+ * Dive path generation.
+ *
+ * BASIC enemies: straight dive downward, slight curve.
+ *   Path: (x, y) → (x + curve, H + 50) using a quadratic bezier feel.
+ *
+ * ZIGZAG enemies: sine-wave horizontal oscillation while descending.
+ *   Path: multiple waypoints with horizontal sine offsets.
+ *
+ * TURRET enemies: slow descent, mid-path pause (to shoot), then continue.
+ *   Path: waypoint sequence with a "hover" segment.
+ *
+ * All paths are stored as arrays of {x, y, t} waypoints where t is the
+ * normalized time (0..1) to reach that point. We use linear interpolation
+ * between waypoints for smooth, jitter-free movement.
+ */
+function generateDivePath(enemy) {
+  const path = [];
+  const startX = enemy.x;
+  const startY = enemy.y;
+  const bottom = H + 40;
+
+  if (enemy.type === 'basic') {
+    // Straight dive with slight arc toward player
+    const midX = startX + (player.x - startX) * 0.3;
+    path.push({ x: startX, y: startY, t: 0 });
+    path.push({ x: midX, y: startY + (bottom - startY) * 0.5, t: 0.4 });
+    path.push({ x: player.x + (Math.random() - 0.5) * 60, y: bottom, t: 1 });
+  } else if (enemy.type === 'zigzag') {
+    // Sine-wave horizontal movement during descent
+    const amplitude = 80;
+    const segments = 6;
+    for (let i = 0; i <= segments; i++) {
+      const t = i / segments;
+      const zigzag = Math.sin(t * Math.PI * 3) * amplitude;
+      path.push({
+        x: startX + zigzag,
+        y: startY + (bottom - startY) * t,
+        t: t
+      });
+    }
+  } else if (enemy.type === 'turret') {
+    // Slow dive with mid-air hover
+    path.push({ x: startX, y: startY, t: 0 });
+    path.push({ x: startX, y: startY + (bottom - startY) * 0.3, t: 0.25 });
+    // Hover phase — same position, later time
+    path.push({ x: startX + (player.x - startX) * 0.2, y: startY + (bottom - startY) * 0.35, t: 0.55 });
+    path.push({ x: player.x + (Math.random() - 0.5) * 40, y: bottom, t: 1 });
+  }
+
+  return path;
+}
+
+/** Interpolate along a dive path at normalized time t */
+function evaluateDivePath(path, t) {
+  if (path.length === 0) return { x: 0, y: 0 };
+  if (t <= 0) return { x: path[0].x, y: path[0].y };
+  if (t >= 1) {
+    const last = path[path.length - 1];
+    return { x: last.x, y: last.y };
+  }
+  // Find the two waypoints bracketing t
+  for (let i = 0; i < path.length - 1; i++) {
+    if (t >= path[i].t && t <= path[i + 1].t) {
+      const segLen = path[i + 1].t - path[i].t;
+      const localT = segLen > 0 ? (t - path[i].t) / segLen : 0;
+      return {
+        x: path[i].x + (path[i + 1].x - path[i].x) * localT,
+        y: path[i].y + (path[i + 1].y - path[i].y) * localT
+      };
+    }
+  }
+  const last = path[path.length - 1];
+  return { x: last.x, y: last.y };
+}
+
+/**
+ * Trigger an enemy to dive.
+ * Selected enemies break from formation, generate a dive path,
+ * and begin following it. The dive frequency scales with wave number.
+ */
+function tryTriggerDive(dt) {
+  const formationEnemies = enemies.filter(e => e.alive && e.state === 'formation');
+  if (formationEnemies.length === 0) return;
+
+  // Pick a random enemy from formation
+  const candidate = formationEnemies[Math.floor(Math.random() * formationEnemies.length)];
+  if (!candidate) return;
+
+  // Check if it's time to dive (probability based on diveFrequency + wave scaling)
+  const diveChance = CONFIG.enemies.diveFrequency * (1 + waveManager.wave * 0.15);
+  if (Math.random() < diveChance) {
+    candidate.state = 'diving';
+    candidate.divePath = generateDivePath(candidate);
+    candidate.diveStartTime = globalTime;
+    candidate.diveDuration = 3000 + Math.random() * 1500; // 3-4.5 seconds
+  }
+}
+
+/** Update diving enemies along their paths */
+function updateDivingEnemies() {
+  enemies.forEach(e => {
+    if (e.state !== 'diving') return;
+
+    const elapsed = (globalTime - e.diveStartTime) * 1000; // ms
+    const progress = Math.min(elapsed / e.diveDuration, 1);
+
+    // Smooth easing: ease-in-out for natural feel
+    const eased = progress < 0.5
+      ? 2 * progress * progress
+      : 1 - Math.pow(-2 * progress + 2, 2) / 2;
+
+    const pos = evaluateDivePath(e.divePath, eased);
+    e.x = pos.x;
+    e.y = pos.y;
+
+    // Enemy shooting during dive
+    e.shootTimer -= 1;
+    if (e.shootTimer <= 0) {
+      const chanceMap = CONFIG.enemies.shootChance;
+      const diffMult = getDifficultyMultiplier(waveManager.wave);
+      if (Math.random() < chanceMap[e.type] * 2 * diffMult) { // Higher chance during dive, scales with difficulty
+        const dx = player.x - e.x;
+        const dy = player.y - e.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist > 0) {
+          const speed = CONFIG.bullets.enemySpeed * Math.min(diffMult, 2.0); // Cap bullet speed at 2x
+          bullets.push(createBullet(
+            e.x, e.y + 10,
+            (dx / dist) * speed,
+            (dy / dist) * speed,
+            'enemy',
+            CONFIG.bullets.enemyRadius
+          ));
+        }
+      }
+      e.shootTimer = Math.max(10, 30 + Math.random() * 60 - waveManager.wave * 2); // Fire faster at higher waves
+    }
+
+    // Path complete — transition to return or removal
+    if (progress >= 1) {
+      e.state = 'returning';
+      e.targetX = e.gridX * ((W - 80) / (getWaveLayout(waveManager.wave).cols + 1)) + 40 + ((W - 80) /
+(getWaveLayout(waveManager.wave).cols + 1)) / 2;
+      e.targetY = 60 + e.gridY * 70;
+    }
+  });
+}
+
+/** Return enemies smoothly to their grid positions */
+function updateReturningEnemies() {
+  enemies.forEach(e => {
+    if (e.state !== 'returning') return;
+    const dx = e.targetX - e.x;
+    const dy = e.targetY - e.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist < 3) {
+      e.state = 'formation';
+      e.x = e.targetX;
+      e.y = e.targetY;
+      return;
+    }
+    const speed = CONFIG.enemies.returnSpeed;
+    e.x += (dx / dist) * speed;
+    e.y += (dy / dist) * speed;
+  });
+}
+
+// ================================================================
+//  FORMATION ENEMY SHOOTING
+// ================================================================
+function updateFormationShooting() {
+  const diffMult = getDifficultyMultiplier(waveManager.wave);
+  enemies.forEach(e => {
+    if (e.state !== 'formation' || !e.alive) return;
+    e.shootTimer -= 1;
+    if (e.shootTimer <= 0) {
+      const chanceMap = CONFIG.enemies.shootChance;
+      if (Math.random() < chanceMap[e.type] * diffMult) {
+        bullets.push(createBullet(
+          e.x, e.y + 10,
+          0,
+          CONFIG.bullets.enemySpeed * Math.min(diffMult, 2.0),
+          'enemy',
+          CONFIG.bullets.enemyRadius
+        ));
+      }
+      e.shootTimer = Math.max(20, 60 + Math.random() * 120 - waveManager.wave * 3);
+    }
+  });
+}
+
+// ================================================================
+//  COLLISION DETECTION — Circle-based
+// ================================================================
+
+/** Check circle-circle overlap */
+function circleCollide(x1, y1, r1, x2, y2, r2) {
+  const dx = x1 - x2;
+  const dy = y1 - y2;
+  return (dx * dx + dy * dy) <= (r1 + r2) * (r1 + r2);
+}
+
+/** Player bounding circle */
+function playerCircle() {
+  return { x: player.x, y: player.y, r: 14 };
+}
+
+function checkCollisions() {
+  const pc = playerCircle();
+
+  // Player bullets vs enemies
+  bullets.forEach(b => {
+    if (b.type !== 'player' || !b.alive) return;
+    enemies.forEach(e => {
+      if (!e.alive) return;
+      const enemyR = e.type === 'turret' ? 16 : e.type === 'zigzag' ? 14 : 12;
+      if (circleCollide(b.x, b.y, b.radius, e.x, e.y, enemyR)) {
+        b.alive = false;
+        e.hp -= 1;
+        AudioSys.play('hit');
+        if (e.hp <= 0) {
+          e.alive = false;
+          score += CONFIG.difficulty.scorePerKill * (e.type === 'turret' ? 3 : e.type === 'zigzag' ? 2 : 1);
+          spawnParticles(e.x, e.y, 12);
+          AudioSys.play('explosion');
+        } else {
+          // Flash effect: small particle burst
+          spawnParticles(b.x, b.y, 3);
+        }
+      }
+    });
+  });
+
+  // Enemy bullets vs player
+  if (player.alive && player.invulnTimer <= 0) {
+    bullets.forEach(b => {
+      if (b.type !== 'enemy' || !b.alive) return;
+      if (circleCollide(b.x, b.y, b.radius, pc.x, pc.y, pc.r)) {
+        b.alive = false;
+        playerHit();
+      }
+    });
+  }
+
+  // Enemies vs player (body collision)
+  if (player.alive && player.invulnTimer <= 0) {
+    enemies.forEach(e => {
+      if (!e.alive) return;
+      const enemyR = e.type === 'turret' ? 16 : e.type === 'zigzag' ? 14 : 12;
+      if (circleCollide(e.x, e.y, enemyR, pc.x, pc.y, pc.r)) {
+        e.alive = false;
+        spawnParticles(e.x, e.y, 12);
+        AudioSys.play('explosion');
+        playerHit();
+      }
+    });
+  }
+}
+
+function playerHit() {
+  player.lives -= 1;
+  spawnParticles(player.x, player.y, 20);
+  AudioSys.play('explosion');
+  if (player.lives <= 0) {
+    player.alive = false;
+    setTimeout(() => {
+      gameState = STATE.GAME_OVER;
+      if (score > highScore) {
+        highScore = score;
+        localStorage.setItem('galaga_highscore', highScore);
+      }
+      AudioSys.play('gameover');
+    }, 1000);
+  } else {
+    player.invulnTimer = CONFIG.player.respawnInvuln;
+    player.x = W / 2;
+    player.y = H - 80;
+  }
+}
+
+// ================================================================
+//  PARTICLE SYSTEM
+// ================================================================
+function spawnParticles(x, y, count) {
+  if (!CONFIG.toggles.particles) return;
+  const colors = CONFIG.colors.particles;
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = CONFIG.particles.speedRange[0] + Math.random() * (CONFIG.particles.speedRange[1] -
+CONFIG.particles.speedRange[0]);
+    const color = colors[Math.floor(Math.random() * colors.length)];
+    const life = CONFIG.particles.lifetime * (0.5 + Math.random() * 0.5);
+    particles.push(createParticle(
+      x, y,
+      Math.cos(angle) * speed,
+      Math.sin(angle) * speed,
+      color,
+      life,
+      2 + Math.random() * 3
+    ));
+  }
+}
+
+function updateParticles() {
+  particles.forEach(p => {
+    if (!p.alive) return;
+    p.x += p.vx;
+    p.y += p.vy;
+    p.life -= 1;
+    if (p.life <= 0) p.alive = false;
+  });
+  particles = particles.filter(p => p.alive);
+}
+
+// ================================================================
+//  DRAWING FUNCTIONS
+// ================================================================
+
+/** Background with subtle grid lines */
+function drawBackground() {
+  c.fillStyle = CONFIG.colors.bg;
+  c.fillRect(0, 0, W, H);
+
+  // Subtle grid
+  c.strokeStyle = CONFIG.colors.gridLines;
+  c.lineWidth = 0.5;
+  const gridSize = 40;
+  for (let x = 0; x <= W; x += gridSize) {
+    c.beginPath();
+    c.moveTo(x, 0);
+    c.lineTo(x, H);
+    c.stroke();
+  }
+  for (let y = 0; y <= H; y += gridSize) {
+    c.beginPath();
+    c.moveTo(0, y);
+    c.lineTo(W, y);
+    c.stroke();
+  }
+}
+
+/** Draw player — sleek upward triangle with engine glow */
+function drawPlayer() {
+  if (!player.alive) return;
+  // Flicker during invulnerability
+  if (player.invulnTimer > 0 && Math.floor(player.invulnTimer / 100) % 2 === 0) return;
+
+  const px = player.x;
+  const py = player.y;
+  const color = CONFIG.colors.player;
+
+  c.save();
+  c.shadowColor = color;
+  c.shadowBlur = 15;
+
+  // Triangle body
+  c.beginPath();
+  c.moveTo(px, py - player.height / 2);
+  c.lineTo(px - player.width / 2, py + player.height / 2);
+  c.lineTo(px + player.width / 2, py + player.height / 2);
+  c.closePath();
+  c.strokeStyle = color;
+  c.lineWidth = 2;
+  c.stroke();
+
+  // Inner fill with slight transparency
+  c.fillStyle = color + '33';
+  c.fill();
+
+  // Engine glow — small ellipse at bottom
+  c.shadowBlur = 25;
+  c.shadowColor = color;
+  c.beginPath();
+  c.ellipse(px, py + player.height / 2 + 4, 4, 8 + Math.sin(globalTime * 10) * 3, 0, 0, Math.PI * 2);
+  c.fillStyle = color + '66';
+  c.fill();
+
+  c.restore();
+}
+
+/** Draw enemies with distinct geometric silhouettes */
+function drawEnemies() {
+  enemies.forEach(e => {
+    if (!e.alive) return;
+    const color = e.type === 'basic' ? CONFIG.colors.enemyBasic
+      : e.type === 'zigzag' ? CONFIG.colors.enemyZigzag
+      : CONFIG.colors.enemyTurret;
+
+    c.save();
+    c.shadowColor = color;
+    c.shadowBlur = 8;
+    c.strokeStyle = color;
+    c.lineWidth = 2;
+    c.fillStyle = color + '22';
+
+    // Wing flap animation — oscillates based on global time
+    const wingFlap = Math.sin(globalTime * 8 + e.gridX * 0.5 + e.gridY * 0.3) * 0.3;
+
+    if (e.type === 'basic') {
+      // ---- Beetle / Firefly bug (Galaga-style) ----
+      // Body — vertical oval
+      c.beginPath();
+      c.ellipse(e.x, e.y, 8, 12, 0, 0, Math.PI * 2);
+      c.fill();
+      c.stroke();
+
+      // Wing membrane — left
+      c.beginPath();
+      c.moveTo(e.x - 8, e.y - 4);
+      c.quadraticCurveTo(e.x - 20, e.y - 8 + wingFlap * 12, e.x - 18, e.y + 4);
+      c.quadraticCurveTo(e.x - 12, e.y + 2, e.x - 8, e.y + 4);
+      c.fillStyle = color + '44';
+      c.fill();
+      c.stroke();
+
+      // Wing membrane — right
+      c.beginPath();
+      c.moveTo(e.x + 8, e.y - 4);
+      c.quadraticCurveTo(e.x + 20, e.y - 8 + wingFlap * 12, e.x + 18, e.y + 4);
+      c.quadraticCurveTo(e.x + 12, e.y + 2, e.x + 8, e.y + 4);
+      c.fill();
+      c.stroke();
+
+      // Antennae
+      c.beginPath();
+      c.moveTo(e.x - 4, e.y - 12);
+      c.quadraticCurveTo(e.x - 10, e.y - 22, e.x - 14, e.y - 20);
+      c.moveTo(e.x + 4, e.y - 12);
+      c.quadraticCurveTo(e.x + 10, e.y - 22, e.x + 14, e.y - 20);
+      c.stroke();
+
+      // Eyes — two bright dots
+      c.fillStyle = '#fff';
+      c.beginPath();
+      c.arc(e.x - 4, e.y - 6, 2.5, 0, Math.PI * 2);
+      c.arc(e.x + 4, e.y - 6, 2.5, 0, Math.PI * 2);
+      c.fill();
+
+      // Legs — three pairs
+      c.lineWidth = 1.5;
+      const legSpread = 6;
+      for (let i = -1; i <= 1; i++) {
+        const ly = e.y + i * 5;
+        c.beginPath();
+        c.moveTo(e.x - 8, ly);
+        c.lineTo(e.x - 8 - legSpread, ly - 3);
+        c.lineTo(e.x - 8 - legSpread, ly + 3);
+        c.moveTo(e.x + 8, ly);
+        c.lineTo(e.x + 8 + legSpread, ly - 3);
+        c.lineTo(e.x + 8 + legSpread, ly + 3);
+        c.stroke();
+      }
+      c.lineWidth = 2;
+
+    } else if (e.type === 'zigzag') {
+      // ---- Dragonfly / Moth bug ----
+      // Body — elongated oval
+      c.beginPath();
+      c.ellipse(e.x, e.y, 6, 14, 0, 0, Math.PI * 2);
+      c.fill();
+      c.stroke();
+
+      // Wings — long and sweeping, left
+      c.beginPath();
+      c.moveTo(e.x - 6, e.y - 6);
+      c.quadraticCurveTo(e.x - 28, e.y - 16 + wingFlap * 14, e.x - 26, e.y - 2);
+      c.quadraticCurveTo(e.x - 16, e.y, e.x - 6, e.y + 2);
+      c.fillStyle = color + '55';
+      c.fill();
+      c.stroke();
+
+      // Wings — long and sweeping, right
+      c.beginPath();
+      c.moveTo(e.x + 6, e.y - 6);
+      c.quadraticCurveTo(e.x + 28, e.y - 16 + wingFlap * 14, e.x + 26, e.y - 2);
+      c.quadraticCurveTo(e.x + 16, e.y, e.x + 6, e.y + 2);
+      c.fill();
+      c.stroke();
+
+      // Lower wings — left
+      c.beginPath();
+      c.moveTo(e.x - 6, e.y + 2);
+      c.quadraticCurveTo(e.x - 22, e.y + 6 + wingFlap * 10, e.x - 20, e.y + 14);
+      c.quadraticCurveTo(e.x - 12, e.y + 10, e.x - 6, e.y + 6);
+      c.fillStyle = color + '33';
+      c.fill();
+      c.stroke();
+
+      // Lower wings — right
+      c.beginPath();
+      c.moveTo(e.x + 6, e.y + 2);
+      c.quadraticCurveTo(e.x + 22, e.y + 6 + wingFlap * 10, e.x + 20, e.y + 14);
+      c.quadraticCurveTo(e.x + 12, e.y + 10, e.x + 6, e.y + 6);
+      c.fill();
+      c.stroke();
+
+      // Antennae — curved
+      c.beginPath();
+      c.moveTo(e.x - 3, e.y - 14);
+      c.quadraticCurveTo(e.x - 8, e.y - 24, e.x - 12, e.y - 22);
+      c.moveTo(e.x + 3, e.y - 14);
+      c.quadraticCurveTo(e.x + 8, e.y - 24, e.x + 12, e.y - 22);
+      c.stroke();
+
+      // Eyes — larger, more menacing
+      c.fillStyle = '#fff';
+      c.beginPath();
+      c.arc(e.x - 3, e.y - 8, 3, 0, Math.PI * 2);
+      c.arc(e.x + 3, e.y - 8, 3, 0, Math.PI * 2);
+      c.fill();
+
+      // Legs — three pairs, thinner
+      c.lineWidth = 1.5;
+      for (let i = -1; i <= 1; i++) {
+        const ly = e.y + i * 5;
+        c.beginPath();
+        c.moveTo(e.x - 6, ly);
+        c.lineTo(e.x - 14, ly - 4);
+        c.lineTo(e.x - 14, ly + 4);
+        c.moveTo(e.x + 6, ly);
+        c.lineTo(e.x + 14, ly - 4);
+        c.lineTo(e.x + 14, ly + 4);
+        c.stroke();
+      }
+      c.lineWidth = 2;
+
+    } else if (e.type === 'turret') {
+      // ---- Armored beetle / Scarab bug ----
+      // Body — wider, armored oval
+      c.beginPath();
+      c.ellipse(e.x, e.y, 12, 14, 0, 0, Math.PI * 2);
+      c.fill();
+      c.stroke();
+
+      // Shell ridge down the middle
+      c.beginPath();
+      c.moveTo(e.x, e.y - 14);
+      c.lineTo(e.x, e.y + 14);
+      c.stroke();
+
+      // Wings — broad and shield-like, left
+      c.beginPath();
+      c.moveTo(e.x - 12, e.y - 6);
+      c.quadraticCurveTo(e.x - 24, e.y - 12 + wingFlap * 8, e.x - 22, e.y + 6);
+      c.quadraticCurveTo(e.x - 16, e.y + 4, e.x - 12, e.y + 6);
+      c.fillStyle = color + '44';
+      c.fill();
+      c.stroke();
+
+      // Wings — broad and shield-like, right
+      c.beginPath();
+      c.moveTo(e.x + 12, e.y - 6);
+      c.quadraticCurveTo(e.x + 24, e.y - 12 + wingFlap * 8, e.x + 22, e.y + 6);
+      c.quadraticCurveTo(e.x + 16, e.y + 4, e.x + 12, e.y + 6);
+      c.fill();
+      c.stroke();
+
+      // Mandibles — pincers at bottom
+      c.beginPath();
+      c.moveTo(e.x - 4, e.y + 14);
+      c.quadraticCurveTo(e.x - 10, e.y + 22, e.x - 6, e.y + 24);
+      c.moveTo(e.x + 4, e.y + 14);
+      c.quadraticCurveTo(e.x + 10, e.y + 22, e.x + 6, e.y + 24);
+      c.stroke();
+
+      // Antennae — short and thick
+      c.beginPath();
+      c.moveTo(e.x - 5, e.y - 14);
+      c.quadraticCurveTo(e.x - 12, e.y - 22, e.x - 8, e.y - 24);
+      c.moveTo(e.x + 5, e.y - 14);
+      c.quadraticCurveTo(e.x + 12, e.y - 22, e.x + 8, e.y - 24);
+      c.stroke();
+
+      // Eyes — glowing red
+      c.fillStyle = '#fff';
+      c.beginPath();
+      c.arc(e.x - 5, e.y - 8, 3, 0, Math.PI * 2);
+      c.arc(e.x + 5, e.y - 8, 3, 0, Math.PI * 2);
+      c.fill();
+
+      // Legs — three pairs, thicker (armored)
+      c.lineWidth = 2;
+      for (let i = -1; i <= 1; i++) {
+        const ly = e.y + i * 6;
+        c.beginPath();
+        c.moveTo(e.x - 12, ly);
+        c.lineTo(e.x - 20, ly - 5);
+        c.lineTo(e.x - 20, ly + 5);
+        c.moveTo(e.x + 12, ly);
+        c.lineTo(e.x + 20, ly - 5);
+        c.lineTo(e.x + 20, ly + 5);
+        c.stroke();
+      }
+      c.lineWidth = 2;
+
+      // HP indicator — small dots above head
+      const dotR = 2;
+      for (let i = 0; i < e.maxHp; i++) {
+        c.beginPath();
+        c.arc(e.x - (e.maxHp - 1) * 4 + i * 8, e.y - 26, dotR, 0, Math.PI * 2);
+        c.fillStyle = i < e.hp ? '#fff' : color + '44';
+        c.fill();
+      }
+    }
+
+    c.restore();
+  });
+}
+
+/** Draw bullets */
+function drawBullets() {
+  bullets.forEach(b => {
+    if (!b.alive) return;
+    c.save();
+    if (b.type === 'player') {
+      c.shadowColor = CONFIG.colors.playerBullet;
+      c.shadowBlur = 10;
+      c.fillStyle = CONFIG.colors.playerBullet;
+      c.beginPath();
+      c.arc(b.x, b.y, b.radius, 0, Math.PI * 2);
+      c.fill();
+      // Trail
+      c.shadowBlur = 0;
+      c.globalAlpha = 0.3;
+      c.beginPath();
+      c.ellipse(b.x, b.y + 8, b.radius * 0.6, 8, 0, 0, Math.PI * 2);
+      c.fill();
+    } else {
+      c.shadowColor = CONFIG.colors.enemyBullet;
+      c.shadowBlur = 8;
+      c.fillStyle = CONFIG.colors.enemyBullet;
+      c.beginPath();
+      c.arc(b.x, b.y, b.radius, 0, Math.PI * 2);
+      c.fill();
+    }
+    c.restore();
+  });
+}
+
+/** Draw particles */
+function drawParticles() {
+  if (!CONFIG.toggles.particles) return;
+  particles.forEach(p => {
+    if (!p.alive) return;
+    const alpha = Math.max(0, p.life / p.maxLife);
+    c.save();
+    c.globalAlpha = alpha;
+    c.fillStyle = p.color;
+    c.shadowColor = p.color;
+    c.shadowBlur = 4;
+    const size = p.size * alpha;
+    c.fillRect(p.x - size / 2, p.y - size / 2, size, size);
+    c.restore();
+  });
+}
+
+/** Draw HUD — score, lives, wave */
+function drawHUD() {
+  c.save();
+  c.fillStyle = CONFIG.colors.accent;
+  c.font = 'bold 16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+  c.textAlign = 'left';
+  c.shadowColor = CONFIG.colors.accent;
+  c.shadowBlur = 6;
+
+  c.fillText(`SCORE ${score}`, 16, 30);
+  c.textAlign = 'right';
+  c.fillText(`WAVE ${waveManager.wave}`, W - 16, 30);
+
+  if (CONFIG.toggles.highScore) {
+    c.textAlign = 'center';
+    c.fillText(`HI ${highScore}`, W / 2, 30);
+  }
+
+  // Lives as small triangles
+  c.textAlign = 'left';
+  for (let i = 0; i < player.lives; i++) {
+    const lx = 16 + i * 22;
+    const ly = 50;
+    c.beginPath();
+    c.moveTo(lx, ly - 6);
+    c.lineTo(lx - 6, ly + 4);
+    c.lineTo(lx + 6, ly + 4);
+    c.closePath();
+    c.strokeStyle = CONFIG.colors.accent;
+    c.lineWidth = 1.5;
+    c.stroke();
+  }
+
+  c.restore();
+}
+
+/** Draw MENU screen */
+function drawMenu() {
+  drawBackground();
+
+  c.save();
+  c.textAlign = 'center';
+
+  // Title
+  c.fillStyle = CONFIG.colors.accent;
+  c.font = 'bold 48px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+  c.shadowColor = CONFIG.colors.accent;
+  c.shadowBlur = 20;
+  c.fillText('GALAGA', W / 2, H * 0.3);
+
+  c.shadowBlur = 0;
+  c.font = '18px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+  c.fillStyle = '#888';
+  c.fillText('Press SPACE or tap to start', W / 2, H * 0.5);
+
+  if (CONFIG.toggles.highScore && highScore > 0) {
+    c.fillStyle = CONFIG.colors.accent;
+    c.font = '16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+    c.fillText(`High Score: ${highScore}`, W / 2, H * 0.6);
+  }
+
+  // Controls info
+  c.fillStyle = '#555';
+  c.font = '13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+  c.fillText('Arrow keys / WASD to move', W / 2, H * 0.75);
+  c.fillText('Space to shoot  •  P to pause', W / 2, H * 0.8);
+
+  c.restore();
+}
+
+/** Draw PAUSED overlay */
+function drawPaused() {
+  c.save();
+  c.fillStyle = 'rgba(0,0,0,0.6)';
+  c.fillRect(0, 0, W, H);
+
+  c.textAlign = 'center';
+  c.fillStyle = CONFIG.colors.accent;
+  c.font = 'bold 36px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+  c.shadowColor = CONFIG.colors.accent;
+  c.shadowBlur = 15;
+  c.fillText('PAUSED', W / 2, H / 2);
+
+  c.shadowBlur = 0;
+  c.font = '16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+  c.fillStyle = '#888';
+  c.fillText('Press P or ESC to resume', W / 2, H / 2 + 40);
+  c.restore();
+}
+
+/** Draw GAME OVER screen */
+function drawGameOver() {
+  drawBackground();
+
+  // Still draw remaining entities behind the overlay
+  drawEnemies();
+  drawParticles();
+  drawBullets();
+  drawPlayer();
+
+  c.save();
+  c.fillStyle = 'rgba(0,0,0,0.55)';
+  c.fillRect(0, 0, W, H);
+
+  c.textAlign = 'center';
+  c.fillStyle = CONFIG.colors.enemyBasic;
+  c.font = 'bold 42px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+  c.shadowColor = CONFIG.colors.enemyBasic;
+  c.shadowBlur = 20;
+  c.fillText('GAME OVER', W / 2, H * 0.35);
+
+  c.shadowBlur = 0;
+  c.fillStyle = CONFIG.colors.accent;
+  c.font = 'bold 24px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+  c.fillText(`Score: ${score}`, W / 2, H * 0.5);
+
+  if (score >= highScore && score > 0) {
+    c.fillStyle = '#f5a623';
+    c.font = 'bold 18px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+    c.fillText('★ NEW HIGH SCORE ★', W / 2, H * 0.58);
+  }
+
+  if (CONFIG.toggles.highScore) {
+    c.fillStyle = '#888';
+    c.font = '16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+    c.fillText(`High Score: ${highScore}`, W / 2, H * 0.66);
+  }
+
+  c.fillStyle = '#666';
+  c.font = '16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+  c.fillText('Press SPACE or tap to retry', W / 2, H * 0.8);
+  c.restore();
+}
+
+// ================================================================
+//  GAME INITIALIZATION
+// ================================================================
+function startGame() {
+  gameState = STATE.PLAYING;
+  score = 0;
+  player = createPlayer();
+  bullets = [];
+  enemies = [];
+  particles = [];
+  waveManager = createWaveManager();
+  spawnWave(waveManager);
+  globalTime = 0;
+}
+
+// ================================================================
+//  MAIN GAME LOOP — 60fps via requestAnimationFrame
+// ================================================================
+function gameLoop(timestamp) {
+  requestAnimationFrame(gameLoop);
+
+  // Delta time in seconds (capped to avoid spiral of death)
+  const dt = Math.min((timestamp - lastTime) / 1000, 0.05);
+  lastTime = timestamp;
+
+  if (gameState === STATE.MENU) {
+    drawMenu();
+    return;
+  }
+
+  if (gameState === STATE.GAME_OVER) {
+    drawGameOver();
+    updateParticles();
+    return;
+  }
+
+  if (gameState === STATE.PAUSED) {
+    // Still render the game underneath
+    drawBackground();
+    drawEnemies();
+    drawBullets();
+    drawPlayer();
+    drawParticles();
+    drawHUD();
+    drawPaused();
+    return;
+  }
+
+  // ---- PLAYING STATE ----
+  globalTime += dt;
+
+  // --- Player movement ---
+  if (player.alive) {
+    if (keys['ArrowLeft'] || keys['KeyA']) player.x -= CONFIG.player.speed;
+    if (keys['ArrowRight'] || keys['KeyD']) player.x += CONFIG.player.speed;
+    // Vertical movement disabled — player stays at fixed Y
+    clampPlayer();
+
+    // Invulnerability timer
+    if (player.invulnTimer > 0) player.invulnTimer -= dt * 1000;
+
+    // Shooting
+    if (player.shootTimer > 0) player.shootTimer -= 1;
+    if (shootPressed && player.shootTimer <= 0) {
+      bullets.push(createBullet(
+        player.x,
+        player.y - player.height / 2,
+        0,
+        -CONFIG.bullets.playerSpeed,
+        'player',
+        CONFIG.bullets.playerRadius
+      ));
+      player.shootTimer = CONFIG.player.shootCooldown;
+      AudioSys.play('shoot');
+    }
+  }
+
+  // --- Update bullets ---
+  bullets.forEach(b => {
+    if (!b.alive) return;
+    b.x += b.vx;
+    b.y += b.vy;
+    // Remove bullets that leave the canvas
+    if (b.y < -20 || b.y > H + 20 || b.x < -20 || b.x > W + 20) {
+      b.alive = false;
+    }
+  });
+  bullets = bullets.filter(b => b.alive);
+
+  // --- Enemy formation & diving ---
+  updateFormationPositions();
+  tryTriggerDive(dt);
+  updateDivingEnemies();
+  updateReturningEnemies();
+  updateFormationShooting();
+
+  // --- Wave progression ---
+  const aliveEnemies = enemies.filter(e => e.alive).length;
+  if (aliveEnemies === 0) {
+    if (!waveManager.waveComplete) {
+      waveManager.waveComplete = true;
+      AudioSys.play('levelUp');
+      waveManager.timer = 0;
+    }
+    // Pause between waves, then spawn the next one
+    waveManager.timer++;
+    if (waveManager.timer > 90) { // ~1.5 second pause between waves
+      waveManager.wave++;
+      if (waveManager.wave > CONFIG.difficulty.maxWave) {
+        // Max wave reached — loop back with higher difficulty
+        waveManager.wave = 1;
+      }
+      waveManager.waveComplete = false;
+      waveManager.timer = 0;
+      spawnWave(waveManager);
+    }
+  }
+
+  // --- Collisions ---
+  checkCollisions();
+
+  // --- Particles ---
+  updateParticles();
+
+  // --- Render ---
+  drawBackground();
+  drawEnemies();
+  drawBullets();
+  drawPlayer();
+  drawParticles();
+  drawHUD();
+}
+
+// ================================================================
+//  BOOTSTRAP — Start the loop
+// ================================================================
+(function boot() {
+  requestAnimationFrame(gameLoop);
+})();
+</script>
+</body>
+</html>

@@ -1545,8 +1545,8 @@ function drawEnemies() {
       c.globalAlpha = e.wrapAlpha;
     }
     c.translate(e.x, e.y);
-    // Invert 180 degrees so enemies face upside down
-    c.rotate((e.rotation || 0) + Math.PI);
+    // Turret enemies are flipped 180 degrees; others keep original orientation
+    c.rotate((e.rotation || 0) + (e.type === 'turret' ? Math.PI : 0));
     // Use per-type glow from CONFIG (fallback to defaults)
     const glow = CONFIG.enemies.glow && CONFIG.enemies.glow[e.type];
     c.shadowColor = glow ? glow.color : color;

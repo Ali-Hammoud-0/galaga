@@ -107,7 +107,13 @@ const CONFIG = {
     diveFrequency: 0.008,
     returnSpeed: 3,
     health: { basic: 1, zigzag: 2, turret: 3 },
-    shootChance: { basic: 0.02, zigzag: 0.03, turret: 0.08 }
+    shootChance: { basic: 0.02, zigzag: 0.03, turret: 0.08 },
+    // Dive path configuration — Galaga-style curved dives with U-turns
+    dive: {
+      curveRadius: 80,         // radius of U-turn arcs (pixels)
+      diveSpeed: 220,          // travel speed along path (pixels/sec)
+      diveDepth: 0.88          // how far down the enemy dives (0..1 fraction of canvas height)
+    }
   },
   particles: { countOnDeath: 18, speedRange: [1, 4], lifetime: 40, fadeRate: 0.025 },
   stars: {
@@ -401,15 +407,19 @@ function createEnemy(type, gridX, gridY, formationX, formationY) {
     gridY,
     hp: hpMap[type] || 1,
     maxHp: hpMap[type] || 1,
-    state: 'formation', // 'formation', 'diving', 'returning'
+    state: 'formation', // 'formation', 'diving'
     diveTimer: 0,
     divePhase: 0,
     alive: true,
     shootTimer: Math.random() * 100,
-    // For dive paths
-    divePath: [],
-    divePathIndex: 0,
+    // Rotation (radians) — 0 = upright in formation
+    rotation: 0,
+    // For Galaga-style dive: segment-based path
     diveStartTime: 0,
+    diveStartX: formationX,
+    diveStartY: formationY,
+    diveDirection: (Math.random() < 0.5) ? -1 : 1, // top U-turn direction
+    divePath: null, // { segments, totalLength }
     // For return
     targetX: formationX,
     targetY: formationY
@@ -510,128 +520,426 @@ function updateFormationPositions() {
 }
 
 /**
- * Dive path generation.
+ * Galaga-style dive system — segment-based path with U-turns.
  *
- * BASIC enemies: straight dive downward, slight curve.
- *   Path: (x, y) → (x + curve, H + 50) using a quadratic bezier feel.
+ * Each dive is built from 7 segments:
+ *   1) Top U-turn: semicircle that starts upright, curves up-left/up-right,
+ *      and ends facing downward along the dive line.
+ *   2) Straight descent to mid-screen: travels toward the player's
+ *      initially anticipated position.
+ *   3-4) Mid-screen S-curve: two quarter-circle arcs that shift the enemy
+ *      laterally toward a newly recalculated player position while keeping
+ *      the enemy moving downward the entire time.
+ *   5) Straight descent to final target: continues toward the bottom.
+ *   6) Bottom U-turn: semicircle that curves from the dive line into
+ *      the ascent line back toward formation.
+ *   7) Straight ascent: travels back toward the formation position.
  *
- * ZIGZAG enemies: sine-wave horizontal oscillation while descending.
- *   Path: multiple waypoints with horizontal sine offsets.
- *
- * TURRET enemies: slow descent, mid-path pause (to shoot), then continue.
- *   Path: waypoint sequence with a "hover" segment.
- *
- * All paths are stored as arrays of {x, y, t} waypoints where t is the
- * normalized time (0..1) to reach that point. We use linear interpolation
- * between waypoints for smooth, jitter-free movement.
+ * Rotation is always derived from the movement tangent so the enemy
+ * faces its direction of travel. As the enemy nears the grid on the
+ * ascent, rotation smoothly interpolates back to 0 (upright).
  */
-function generateDivePath(enemy) {
-  const path = [];
-  const startX = enemy.x;
-  const startY = enemy.y;
-  const bottom = H + 40;
 
-  if (enemy.type === 'basic') {
-    // Straight dive with slight arc toward player
-    const midX = startX + (player.x - startX) * 0.3;
-    path.push({ x: startX, y: startY, t: 0 });
-    path.push({ x: midX, y: startY + (bottom - startY) * 0.5, t: 0.4 });
-    path.push({ x: player.x + (Math.random() - 0.5) * 60, y: bottom, t: 1 });
-  } else if (enemy.type === 'zigzag') {
-    // Sine-wave horizontal movement during descent
-    const amplitude = 80;
-    const segments = 6;
-    for (let i = 0; i <= segments; i++) {
-      const t = i / segments;
-      const zigzag = Math.sin(t * Math.PI * 3) * amplitude;
-      path.push({
-        x: startX + zigzag,
-        y: startY + (bottom - startY) * t,
-        t: t
-      });
-    }
-  } else if (enemy.type === 'turret') {
-    // Slow dive with mid-air hover
-    path.push({ x: startX, y: startY, t: 0 });
-    path.push({ x: startX, y: startY + (bottom - startY) * 0.3, t: 0.25 });
-    // Hover phase — same position, later time
-    path.push({ x: startX + (player.x - startX) * 0.2, y: startY + (bottom - startY) * 0.35, t: 0.55 });
-    path.push({ x: player.x + (Math.random() - 0.5) * 40, y: bottom, t: 1 });
+/**
+ * Build a segment-based dive path for the given enemy.
+ *
+ * Path structure (7 segments):
+ *   1) Top U-turn: semicircle — starts upright, curves up-left/up-right,
+ *      ends facing straight down.
+ *   2) Straight descent to mid-screen: from U-turn exit toward the
+ *      player's initially anticipated position at ~45% canvas height.
+ *   3) S-curve arc A: quarter-circle — turns from facing-down to
+ *      facing-sideways (left or right depending on new target).
+ *   4) S-curve arc B: quarter-circle — turns from facing-sideways
+ *      back to facing-down, completing the lateral shift.
+ *   5) Straight descent to final target: from S-curve exit to the
+ *      bottom of the dive.
+ *   6) Bottom U-turn: semicircle — starts facing down, curves up,
+ *      ends facing straight up.
+ *   7) Straight ascent: from U-turn exit back to formation.
+ *
+ * Arc segments store: { cx, cy, radius, startAngle, endAngle, isCW }
+ *   - CW arc tangent:  angle + PI/2
+ *   - CCW arc tangent: angle - PI/2
+ *
+ * Line segments store: { fromX, fromY, toX, toY }
+ *
+ * Total arc+line lengths determine travel time at a fixed speed.
+ */
+function buildDivePath(enemy) {
+  const R = CONFIG.enemies.dive.curveRadius;
+  const dir = enemy.diveDirection; // -1 = curve left, +1 = curve right
+  const startX = enemy.diveStartX;
+  const startY = enemy.diveStartY;
+  const bottomY = H * CONFIG.enemies.dive.diveDepth;
+
+  // --- Mid-screen Y threshold: where the enemy recalculates target ---
+  const midScreenY = H * 0.45;
+
+  // --- Initial target: player's anticipated position at mid-screen ---
+  const midTargetX = Math.max(30, Math.min(W - 30, player.x + (Math.random() - 0.5) * 80));
+
+  // =====================
+  // Segment 1: Top U-turn (semicircle, sweep = PI)
+  // Starts facing up (-PI/2), ends facing down (PI/2)
+  // =====================
+  let topArc;
+  if (dir === 1) {
+    // CW arc — center to the RIGHT of start
+    const cx = startX + R;
+    const cy = startY;
+    // startAngle = -PI → point = (cx - R, cy) = (startX, startY) ✓
+    // tangent at -PI = -PI + PI/2 = -PI/2 (up) ✓
+    // endAngle = 0 → point = (cx + R, cy) = (startX + 2R, startY)
+    // tangent at 0 = 0 + PI/2 = PI/2 (down) ✓
+    topArc = {
+      type: 'arc', cx, cy, radius: R,
+      startAngle: -Math.PI, endAngle: 0, isCW: true,
+      length: R * Math.PI
+    };
+  } else {
+    // CCW arc — center to the LEFT of start
+    const cx = startX - R;
+    const cy = startY;
+    // startAngle = 0 → point = (cx + R, cy) = (startX, startY) ✓
+    // tangent at 0 = 0 - PI/2 = -PI/2 (up) ✓
+    // endAngle = -PI → point = (cx - R, cy) = (startX - 2R, startY)
+    // tangent at -PI = -PI - PI/2 = -3PI/2 = PI/2 (down) ✓
+    topArc = {
+      type: 'arc', cx, cy, radius: R,
+      startAngle: 0, endAngle: -Math.PI, isCW: false,
+      length: R * Math.PI
+    };
   }
+  const topExitX = topArc.cx + topArc.radius * Math.cos(topArc.endAngle);
+  const topExitY = topArc.cy + topArc.radius * Math.sin(topArc.endAngle);
 
-  return path;
+  // =====================
+  // Segment 2: Straight descent to mid-screen
+  // From top U-turn exit toward the initial anticipated player position at mid-screen Y
+  // =====================
+  const midDx = midTargetX - topExitX;
+  const midDy = midScreenY - topExitY;
+  const midLength = Math.sqrt(midDx * midDx + midDy * midDy);
+  const midLine = {
+    type: 'line',
+    fromX: topExitX, fromY: topExitY,
+    toX: midTargetX, toY: midScreenY,
+    length: midLength
+  };
+
+  // --- At mid-screen: recalculate player's anticipated position for the final dive target ---
+  const finalTargetX = Math.max(30, Math.min(W - 30, player.x + (Math.random() - 0.5) * 100));
+  const finalTargetY = bottomY;
+
+  // =====================
+  // Segments 3 & 4: Mid-screen S-curve (two quarter-circle arcs)
+  // Enemy is facing down at mid-screen. The S-curve shifts the enemy laterally
+  // toward the new target while keeping it moving DOWNWARD the entire time.
+  //   Arc A: quarter-circle from facing-down to facing-sideways
+  //   Arc B: quarter-circle from facing-sideways back to facing-down
+  // Total lateral shift = 2R, total vertical drop = 2R.
+  // =====================
+  const midCurveDir = (finalTargetX >= midTargetX) ? 1 : -1;
+
+  let arcA, arcB;
+  if (midCurveDir === 1) {
+    // --- Curve RIGHT ---
+    // Arc A (CCW): down → right
+    //   tangent = angle - PI/2
+    //   start: tangent=PI/2 (down) → angle=PI, point=(cx-R, cy)=(midTargetX, midScreenY)
+    //   end:   tangent=0 (right)  → angle=PI/2, point=(cx, cy+R)=(midTargetX+R, midScreenY+R)
+    arcA = {
+      type: 'arc',
+      cx: midTargetX + R, cy: midScreenY, radius: R,
+      startAngle: Math.PI, endAngle: Math.PI / 2, isCW: false,
+      length: R * Math.PI / 2,
+      rotationBlend: 0.6  // blend 60% toward downward-facing to reduce tilt
+    };
+    // Arc B (CW): right → down
+    //   tangent = angle + PI/2
+    //   start: tangent=0 (right)  → angle=-PI/2, point=(cx, cy-R)=(midTargetX+R, midScreenY+R)
+    //   end:   tangent=PI/2 (down) → angle=0, point=(cx+R, cy)=(midTargetX+2R, midScreenY+2R)
+    arcB = {
+      type: 'arc',
+      cx: midTargetX + R, cy: midScreenY + 2 * R, radius: R,
+      startAngle: -Math.PI / 2, endAngle: 0, isCW: true,
+      length: R * Math.PI / 2,
+      rotationBlend: 0.6  // blend 60% toward downward-facing to reduce tilt
+    };
+  } else {
+    // --- Curve LEFT ---
+    // Arc A (CW): down → left
+    //   tangent = angle + PI/2
+    //   start: tangent=PI/2 (down) → angle=0, point=(cx+R, cy)=(midTargetX, midScreenY)
+    //   end:   tangent=PI (left)   → angle=PI/2, point=(cx, cy+R)=(midTargetX-R, midScreenY+R)
+    arcA = {
+      type: 'arc',
+      cx: midTargetX - R, cy: midScreenY, radius: R,
+      startAngle: 0, endAngle: Math.PI / 2, isCW: true,
+      length: R * Math.PI / 2,
+      rotationBlend: 0.6  // blend 60% toward downward-facing to reduce tilt
+    };
+    // Arc B (CCW): left → down
+    //   tangent = angle - PI/2
+    //   start: tangent=PI (left)   → angle=3PI/2, point=(cx, cy-R)=(midTargetX-R, midScreenY+R)
+    //   end:   tangent=PI/2 (down) → angle=PI, point=(cx-R, cy)=(midTargetX-2R, midScreenY+2R)
+    arcB = {
+      type: 'arc',
+      cx: midTargetX - R, cy: midScreenY + 2 * R, radius: R,
+      startAngle: 3 * Math.PI / 2, endAngle: Math.PI, isCW: false,
+      length: R * Math.PI / 2,
+      rotationBlend: 0.6  // blend 60% toward downward-facing to reduce tilt
+    };
+  }
+  const sCurveExitX = arcB.cx + arcB.radius * Math.cos(arcB.endAngle);
+  const sCurveExitY = arcB.cy + arcB.radius * Math.sin(arcB.endAngle);
+
+  // =====================
+  // Segment 5: Straight descent from S-curve exit to final target
+  // =====================
+  const finalDx = finalTargetX - sCurveExitX;
+  const finalDy = finalTargetY - sCurveExitY;
+  const finalLength = Math.sqrt(finalDx * finalDx + finalDy * finalDy);
+  const finalLine = {
+    type: 'line',
+    fromX: sCurveExitX, fromY: sCurveExitY,
+    toX: finalTargetX, toY: finalTargetY,
+    length: finalLength
+  };
+
+  // =====================
+  // Segment 6: Bottom U-turn (semicircle, sweep = PI)
+  // Starts facing down (PI/2), ends facing up (-PI/2)
+  // =====================
+  const ascentTargetX = enemy.targetX;
+  const ascentTargetY = enemy.targetY;
+  const bottomDir = (ascentTargetX >= finalTargetX) ? 1 : -1;
+
+  let bottomArc;
+  if (bottomDir === 1) {
+    const cx = finalTargetX - R;
+    const cy = finalTargetY;
+    bottomArc = {
+      type: 'arc', cx, cy, radius: R,
+      startAngle: 0, endAngle: Math.PI, isCW: true,
+      length: R * Math.PI
+    };
+  } else {
+    const cx = finalTargetX + R;
+    const cy = finalTargetY;
+    bottomArc = {
+      type: 'arc', cx, cy, radius: R,
+      startAngle: Math.PI, endAngle: 0, isCW: false,
+      length: R * Math.PI
+    };
+  }
+  const bottomExitX = bottomArc.cx + bottomArc.radius * Math.cos(bottomArc.endAngle);
+  const bottomExitY = bottomArc.cy + bottomArc.radius * Math.sin(bottomArc.endAngle);
+
+  // =====================
+  // Segment 7: Straight ascent
+  // From bottom U-turn exit to formation position
+  // =====================
+  const ascentDx = ascentTargetX - bottomExitX;
+  const ascentDy = ascentTargetY - bottomExitY;
+  const ascentLength = Math.sqrt(ascentDx * ascentDx + ascentDy * ascentDy);
+  const ascentLine = {
+    type: 'line',
+    fromX: bottomExitX, fromY: bottomExitY,
+    toX: ascentTargetX, toY: ascentTargetY,
+    length: ascentLength
+  };
+
+  const segments = [topArc, midLine, arcA, arcB, finalLine, bottomArc, ascentLine];
+  const totalLength = segments.reduce((sum, s) => sum + s.length, 0);
+  return { segments, totalLength };
 }
 
-/** Interpolate along a dive path at normalized time t */
-function evaluateDivePath(path, t) {
-  if (path.length === 0) return { x: 0, y: 0 };
-  if (t <= 0) return { x: path[0].x, y: path[0].y };
-  if (t >= 1) {
-    const last = path[path.length - 1];
-    return { x: last.x, y: last.y };
-  }
-  // Find the two waypoints bracketing t
-  for (let i = 0; i < path.length - 1; i++) {
-    if (t >= path[i].t && t <= path[i + 1].t) {
-      const segLen = path[i + 1].t - path[i].t;
-      const localT = segLen > 0 ? (t - path[i].t) / segLen : 0;
-      return {
-        x: path[i].x + (path[i + 1].x - path[i].x) * localT,
-        y: path[i].y + (path[i + 1].y - path[i].y) * localT
-      };
-    }
-  }
-  const last = path[path.length - 1];
-  return { x: last.x, y: last.y };
+/** Interpolate between two angles using the shortest angular path. */
+function shortestAngleLerp(a, b, t) {
+  let diff = b - a;
+  while (diff >  Math.PI) diff -= 2 * Math.PI;
+  while (diff < -Math.PI) diff += 2 * Math.PI;
+  return a + diff * t;
 }
 
 /**
- * Trigger an enemy to dive.
- * Selected enemies break from formation, generate a dive path,
- * and begin following it. The dive frequency scales with wave number.
+  * Evaluate position and rotation along a segment path at distance d from start.
+  * Returns { x, y, rotation }.
+  *
+  * Rotation follows the movement tangent so the enemy faces its direction
+  * of travel. A +PI/2 face-offset is applied because the enemy sprite's
+  * "front" (eyes / antennae) points UP in local space (rotation = 0 means
+  * the sprite faces up).  After the offset: tangent -PI/2 (up) gives
+  * rotation 0 (upright); tangent +PI/2 (down) gives rotation PI (facing
+  * down).
+  *
+  * A short blend zone at each segment boundary prevents the rotation from
+  * "snapping" when the tangent of one segment doesn't perfectly match the
+  * tangent of the next.
+  *
+  * On the final ascent segment, rotation smoothly blends back to 0 (upright)
+  * as the enemy nears the formation grid.
+  */
+function evaluatePath(path, d) {
+  let remaining = d;
+  let prevSegment = null;
+  const blendZone = 20; // pixels - smooth rotation over this distance at boundaries
+
+  for (let i = 0; i < path.segments.length; i++) {
+    const seg = path.segments[i];
+    const isLastSegment = (i === path.segments.length - 1);
+
+    if (remaining <= seg.length || isLastSegment) {
+      const t = isLastSegment
+        ? Math.min(remaining / seg.length, 1)
+        : remaining / seg.length;
+
+      let x, y, tangentRotation;
+
+      if (seg.type === 'arc') {
+        const angle = seg.startAngle + (seg.endAngle - seg.startAngle) * t;
+        x = seg.cx + seg.radius * Math.cos(angle);
+        y = seg.cy + seg.radius * Math.sin(angle);
+        // Tangent direction:
+        //   CW arc:  angle + PI/2
+        //   CCW arc: angle - PI/2
+        tangentRotation = seg.isCW ? (angle + Math.PI / 2) : (angle - Math.PI / 2);
+      } else {
+        // Line segment
+        x = seg.fromX + (seg.toX - seg.fromX) * t;
+        y = seg.fromY + (seg.toY - seg.fromY) * t;
+        tangentRotation = Math.atan2(seg.toY - seg.fromY, seg.toX - seg.fromX);
+      }
+
+      // Add face-offset so the enemy sprite faces its direction of travel.
+      // Sprite front points UP at rotation=0, so visualFacing = rotation - PI/2.
+      // We want visualFacing == tangentRotation  =>  rotation = tangentRotation + PI/2.
+      let rotation = tangentRotation + Math.PI / 2;
+
+      // If this segment has a rotationBlend factor, blend toward downward-facing
+      // to reduce aggressive tilting during mid-screen S-curves.
+      // Downward-facing = tangent PI/2 => visual rotation = PI.
+      if (seg.rotationBlend > 0) {
+        const downwardRotation = Math.PI;
+        let diff = downwardRotation - rotation;
+        while (diff >  Math.PI) diff -= 2 * Math.PI;
+        while (diff < -Math.PI) diff += 2 * Math.PI;
+        rotation += diff * seg.rotationBlend;
+      }
+
+      // --- Blend at segment boundaries to prevent snapping ---
+      if (prevSegment && remaining < blendZone) {
+        // Tangent at the end of the previous segment
+        let prevEndTangent;
+        if (prevSegment.type === 'arc') {
+          prevEndTangent = prevSegment.isCW
+            ? (prevSegment.endAngle + Math.PI / 2)
+            : (prevSegment.endAngle - Math.PI / 2);
+        } else {
+          prevEndTangent = Math.atan2(
+            prevSegment.toY - prevSegment.fromY,
+            prevSegment.toX - prevSegment.fromX
+          );
+        }
+        let prevEndVisual = prevEndTangent + Math.PI / 2;
+        // If the previous segment had a rotationBlend, apply it to the
+        // previous-end visual rotation too, so the boundary blend starts
+        // from the same blended value (prevents jitter at S-curve joins).
+        if (prevSegment.rotationBlend > 0) {
+          const downwardRotation = Math.PI;
+          let diff = downwardRotation - prevEndVisual;
+          while (diff >  Math.PI) diff -= 2 * Math.PI;
+          while (diff < -Math.PI) diff += 2 * Math.PI;
+          prevEndVisual += diff * prevSegment.rotationBlend;
+        }
+        const effectiveBlend = Math.min(blendZone, seg.length * 0.3);
+        const blendT = Math.min(remaining / effectiveBlend, 1);
+        rotation = shortestAngleLerp(prevEndVisual, rotation, blendT);
+      }
+
+      // On the last segment (ascent), blend rotation toward 0 (upright)
+      // over the last 50% of the segment for a smooth lock-in.
+      if (isLastSegment && t > 0.5) {
+        const blendT = (t - 0.5) / 0.5; // 0..1
+        let diff = -rotation;
+        while (diff >  Math.PI) diff -= 2 * Math.PI;
+        while (diff < -Math.PI) diff += 2 * Math.PI;
+        rotation += diff * blendT;
+      }
+
+      return { x, y, rotation };
+    }
+    prevSegment = seg;
+    remaining -= seg.length;
+  }
+
+  // Fallback: end of last segment, upright
+  const last = path.segments[path.segments.length - 1];
+  if (last.type === 'line') {
+    return { x: last.toX, y: last.toY, rotation: 0 };
+  }
+  const endAngle = last.endAngle;
+  const rot = last.isCW ? (endAngle + Math.PI / 2) : (endAngle - Math.PI / 2);
+  return {
+    x: last.cx + last.radius * Math.cos(endAngle),
+    y: last.cy + last.radius * Math.sin(endAngle),
+    rotation: rot + Math.PI / 2
+  };
+}
+
+/**
+ * Trigger an enemy to dive from formation.
  */
 function tryTriggerDive(dt) {
   const formationEnemies = enemies.filter(e => e.alive && e.state === 'formation');
   if (formationEnemies.length === 0) return;
 
-  // Pick a random enemy from formation
   const candidate = formationEnemies[Math.floor(Math.random() * formationEnemies.length)];
   if (!candidate) return;
 
-  // Check if it's time to dive (probability based on diveFrequency + wave scaling)
   const diveChance = CONFIG.enemies.diveFrequency * (1 + waveManager.wave * 0.15);
   if (Math.random() < diveChance) {
     candidate.state = 'diving';
-    candidate.divePath = generateDivePath(candidate);
     candidate.diveStartTime = globalTime;
-    candidate.diveDuration = 3000 + Math.random() * 1500; // 3-4.5 seconds
+    candidate.diveStartX = candidate.x;
+    candidate.diveStartY = candidate.y;
+    candidate.diveDirection = (Math.random() < 0.5) ? -1 : 1;
+    candidate.rotation = 0;
+    candidate.divePath = buildDivePath(candidate);
   }
 }
 
-/** Update diving enemies along their paths */
+/**
+ * Update diving enemies along their segment path.
+ *
+ * The enemy travels at a constant speed along the path. Total duration
+ * is computed from the path length and a configured speed.
+ */
 function updateDivingEnemies() {
+  const diveSpeed = CONFIG.enemies.dive.diveSpeed || 200; // pixels per second
+
   enemies.forEach(e => {
     if (e.state !== 'diving') return;
 
-    const elapsed = (globalTime - e.diveStartTime) * 1000; // ms
-    const progress = Math.min(elapsed / e.diveDuration, 1);
+    const elapsed = (globalTime - e.diveStartTime); // seconds
+    const dist = elapsed * diveSpeed;
 
-    // Smooth easing: ease-in-out for natural feel
-    const eased = progress < 0.5
-      ? 2 * progress * progress
-      : 1 - Math.pow(-2 * progress + 2, 2) / 2;
+    if (!e.divePath) return;
 
-    const pos = evaluateDivePath(e.divePath, eased);
+    const pos = evaluatePath(e.divePath, dist);
     e.x = pos.x;
     e.y = pos.y;
+    e.rotation = pos.rotation;
 
     // Enemy shooting during dive
     e.shootTimer -= 1;
     if (e.shootTimer <= 0) {
       const chanceMap = CONFIG.enemies.shootChance;
       const diffMult = getDifficultyMultiplier(waveManager.wave);
-      if (Math.random() < chanceMap[e.type] * 2 * diffMult) { // Higher chance during dive, scales with difficulty
-        const speed = CONFIG.bullets.enemySpeed * Math.min(diffMult, 2.0); // Cap bullet speed at 2x
+      if (Math.random() < chanceMap[e.type] * 2 * diffMult) {
+        const speed = CONFIG.bullets.enemySpeed * Math.min(diffMult, 2.0);
         bullets.push(createBullet(
           e.x, e.y + 10,
           0,
@@ -639,35 +947,25 @@ function updateDivingEnemies() {
           'enemy'
         ));
       }
-      e.shootTimer = Math.max(10, 30 + Math.random() * 60 - waveManager.wave * 2); // Fire faster at higher waves
+      e.shootTimer = Math.max(10, 30 + Math.random() * 60 - waveManager.wave * 2);
     }
 
-    // Path complete — transition to return or removal
-    if (progress >= 1) {
-      e.state = 'returning';
-      e.targetX = e.gridX * ((W - 80) / (getWaveLayout(waveManager.wave).cols + 1)) + 40 + ((W - 80) /
-(getWaveLayout(waveManager.wave).cols + 1)) / 2;
-      e.targetY = 60 + e.gridY * 70;
+    // Path complete — transition back to formation
+    if (dist >= e.divePath.totalLength) {
+      e.state = 'formation';
+      e.rotation = 0;
+      e.x = e.targetX;
+      e.y = e.targetY;
     }
   });
 }
 
-/** Return enemies smoothly to their grid positions */
+/**
+ * No separate returning phase — the return is part of the dive path
+ * (segments 3-4). This function is a no-op now.
+ */
 function updateReturningEnemies() {
-  enemies.forEach(e => {
-    if (e.state !== 'returning') return;
-    const dx = e.targetX - e.x;
-    const dy = e.targetY - e.y;
-    const dist = Math.sqrt(dx * dx + dy * dy);
-    if (dist < 3) {
-      e.state = 'formation';
-      // Do NOT snap position — let formation sway take over smoothly
-      return;
-    }
-    const speed = CONFIG.enemies.returnSpeed;
-    e.x += (dx / dist) * speed;
-    e.y += (dy / dist) * speed;
-  });
+  // Return is handled inline in updateDivingEnemies
 }
 
 // ================================================================
@@ -956,6 +1254,8 @@ function drawEnemies() {
       : CONFIG.colors.enemyTurret;
 
     c.save();
+    c.translate(e.x, e.y);
+    c.rotate(e.rotation || 0);
     c.shadowColor = color;
     c.shadowBlur = 8;
     c.strokeStyle = color;
@@ -969,54 +1269,54 @@ function drawEnemies() {
       // ---- Beetle / Firefly bug (Galaga-style) ----
       // Body — vertical oval
       c.beginPath();
-      c.ellipse(e.x, e.y, 8, 12, 0, 0, Math.PI * 2);
+      c.ellipse(0, 0, 8, 12, 0, 0, Math.PI * 2);
       c.fill();
       c.stroke();
 
       // Wing membrane — left
       c.beginPath();
-      c.moveTo(e.x - 8, e.y - 4);
-      c.quadraticCurveTo(e.x - 20, e.y - 8 + wingFlap * 12, e.x - 18, e.y + 4);
-      c.quadraticCurveTo(e.x - 12, e.y + 2, e.x - 8, e.y + 4);
+      c.moveTo(-8, -4);
+      c.quadraticCurveTo(-20, -8 + wingFlap * 12, -18, 4);
+      c.quadraticCurveTo(-12, 2, -8, 4);
       c.fillStyle = color + '44';
       c.fill();
       c.stroke();
 
       // Wing membrane — right
       c.beginPath();
-      c.moveTo(e.x + 8, e.y - 4);
-      c.quadraticCurveTo(e.x + 20, e.y - 8 + wingFlap * 12, e.x + 18, e.y + 4);
-      c.quadraticCurveTo(e.x + 12, e.y + 2, e.x + 8, e.y + 4);
+      c.moveTo(8, -4);
+      c.quadraticCurveTo(20, -8 + wingFlap * 12, 18, 4);
+      c.quadraticCurveTo(12, 2, 8, 4);
       c.fill();
       c.stroke();
 
       // Antennae
       c.beginPath();
-      c.moveTo(e.x - 4, e.y - 12);
-      c.quadraticCurveTo(e.x - 10, e.y - 22, e.x - 14, e.y - 20);
-      c.moveTo(e.x + 4, e.y - 12);
-      c.quadraticCurveTo(e.x + 10, e.y - 22, e.x + 14, e.y - 20);
+      c.moveTo(-4, -12);
+      c.quadraticCurveTo(-10, -22, -14, -20);
+      c.moveTo(4, -12);
+      c.quadraticCurveTo(10, -22, 14, -20);
       c.stroke();
 
       // Eyes — two bright dots
       c.fillStyle = '#fff';
       c.beginPath();
-      c.arc(e.x - 4, e.y - 6, 2.5, 0, Math.PI * 2);
-      c.arc(e.x + 4, e.y - 6, 2.5, 0, Math.PI * 2);
+      c.arc(-4, -6, 2.5, 0, Math.PI * 2);
+      c.arc(4, -6, 2.5, 0, Math.PI * 2);
       c.fill();
 
       // Legs — three pairs
       c.lineWidth = 1.5;
       const legSpread = 6;
       for (let i = -1; i <= 1; i++) {
-        const ly = e.y + i * 5;
+        const ly = i * 5;
         c.beginPath();
-        c.moveTo(e.x - 8, ly);
-        c.lineTo(e.x - 8 - legSpread, ly - 3);
-        c.lineTo(e.x - 8 - legSpread, ly + 3);
-        c.moveTo(e.x + 8, ly);
-        c.lineTo(e.x + 8 + legSpread, ly - 3);
-        c.lineTo(e.x + 8 + legSpread, ly + 3);
+        c.moveTo(-8, ly);
+        c.lineTo(-8 - legSpread, ly - 3);
+        c.lineTo(-8 - legSpread, ly + 3);
+        c.moveTo(8, ly);
+        c.lineTo(8 + legSpread, ly - 3);
+        c.lineTo(8 + legSpread, ly + 3);
         c.stroke();
       }
       c.lineWidth = 2;
@@ -1025,70 +1325,70 @@ function drawEnemies() {
       // ---- Dragonfly / Moth bug ----
       // Body — elongated oval
       c.beginPath();
-      c.ellipse(e.x, e.y, 6, 14, 0, 0, Math.PI * 2);
+      c.ellipse(0, 0, 6, 14, 0, 0, Math.PI * 2);
       c.fill();
       c.stroke();
 
       // Wings — long and sweeping, left
       c.beginPath();
-      c.moveTo(e.x - 6, e.y - 6);
-      c.quadraticCurveTo(e.x - 28, e.y - 16 + wingFlap * 14, e.x - 26, e.y - 2);
-      c.quadraticCurveTo(e.x - 16, e.y, e.x - 6, e.y + 2);
+      c.moveTo(-6, -6);
+      c.quadraticCurveTo(-28, -16 + wingFlap * 14, -26, -2);
+      c.quadraticCurveTo(-16, 0, -6, 2);
       c.fillStyle = color + '55';
       c.fill();
       c.stroke();
 
       // Wings — long and sweeping, right
       c.beginPath();
-      c.moveTo(e.x + 6, e.y - 6);
-      c.quadraticCurveTo(e.x + 28, e.y - 16 + wingFlap * 14, e.x + 26, e.y - 2);
-      c.quadraticCurveTo(e.x + 16, e.y, e.x + 6, e.y + 2);
+      c.moveTo(6, -6);
+      c.quadraticCurveTo(28, -16 + wingFlap * 14, 26, -2);
+      c.quadraticCurveTo(16, 0, 6, 2);
       c.fill();
       c.stroke();
 
       // Lower wings — left
       c.beginPath();
-      c.moveTo(e.x - 6, e.y + 2);
-      c.quadraticCurveTo(e.x - 22, e.y + 6 + wingFlap * 10, e.x - 20, e.y + 14);
-      c.quadraticCurveTo(e.x - 12, e.y + 10, e.x - 6, e.y + 6);
+      c.moveTo(-6, 2);
+      c.quadraticCurveTo(-22, 6 + wingFlap * 10, -20, 14);
+      c.quadraticCurveTo(-12, 10, -6, 6);
       c.fillStyle = color + '33';
       c.fill();
       c.stroke();
 
       // Lower wings — right
       c.beginPath();
-      c.moveTo(e.x + 6, e.y + 2);
-      c.quadraticCurveTo(e.x + 22, e.y + 6 + wingFlap * 10, e.x + 20, e.y + 14);
-      c.quadraticCurveTo(e.x + 12, e.y + 10, e.x + 6, e.y + 6);
+      c.moveTo(6, 2);
+      c.quadraticCurveTo(22, 6 + wingFlap * 10, 20, 14);
+      c.quadraticCurveTo(12, 10, 6, 6);
       c.fill();
       c.stroke();
 
       // Antennae — curved
       c.beginPath();
-      c.moveTo(e.x - 3, e.y - 14);
-      c.quadraticCurveTo(e.x - 8, e.y - 24, e.x - 12, e.y - 22);
-      c.moveTo(e.x + 3, e.y - 14);
-      c.quadraticCurveTo(e.x + 8, e.y - 24, e.x + 12, e.y - 22);
+      c.moveTo(-3, -14);
+      c.quadraticCurveTo(-8, -24, -12, -22);
+      c.moveTo(3, -14);
+      c.quadraticCurveTo(8, -24, 12, -22);
       c.stroke();
 
       // Eyes — larger, more menacing
       c.fillStyle = '#fff';
       c.beginPath();
-      c.arc(e.x - 3, e.y - 8, 3, 0, Math.PI * 2);
-      c.arc(e.x + 3, e.y - 8, 3, 0, Math.PI * 2);
+      c.arc(-3, -8, 3, 0, Math.PI * 2);
+      c.arc(3, -8, 3, 0, Math.PI * 2);
       c.fill();
 
       // Legs — three pairs, thinner
       c.lineWidth = 1.5;
       for (let i = -1; i <= 1; i++) {
-        const ly = e.y + i * 5;
+        const ly = i * 5;
         c.beginPath();
-        c.moveTo(e.x - 6, ly);
-        c.lineTo(e.x - 14, ly - 4);
-        c.lineTo(e.x - 14, ly + 4);
-        c.moveTo(e.x + 6, ly);
-        c.lineTo(e.x + 14, ly - 4);
-        c.lineTo(e.x + 14, ly + 4);
+        c.moveTo(-6, ly);
+        c.lineTo(-14, ly - 4);
+        c.lineTo(-14, ly + 4);
+        c.moveTo(6, ly);
+        c.lineTo(14, ly - 4);
+        c.lineTo(14, ly + 4);
         c.stroke();
       }
       c.lineWidth = 2;
@@ -1097,67 +1397,67 @@ function drawEnemies() {
       // ---- Armored beetle / Scarab bug ----
       // Body — wider, armored oval
       c.beginPath();
-      c.ellipse(e.x, e.y, 12, 14, 0, 0, Math.PI * 2);
+      c.ellipse(0, 0, 12, 14, 0, 0, Math.PI * 2);
       c.fill();
       c.stroke();
 
       // Shell ridge down the middle
       c.beginPath();
-      c.moveTo(e.x, e.y - 14);
-      c.lineTo(e.x, e.y + 14);
+      c.moveTo(0, -14);
+      c.lineTo(0, 14);
       c.stroke();
 
       // Wings — broad and shield-like, left
       c.beginPath();
-      c.moveTo(e.x - 12, e.y - 6);
-      c.quadraticCurveTo(e.x - 24, e.y - 12 + wingFlap * 8, e.x - 22, e.y + 6);
-      c.quadraticCurveTo(e.x - 16, e.y + 4, e.x - 12, e.y + 6);
+      c.moveTo(-12, -6);
+      c.quadraticCurveTo(-24, -12 + wingFlap * 8, -22, 6);
+      c.quadraticCurveTo(-16, 4, -12, 6);
       c.fillStyle = color + '44';
       c.fill();
       c.stroke();
 
       // Wings — broad and shield-like, right
       c.beginPath();
-      c.moveTo(e.x + 12, e.y - 6);
-      c.quadraticCurveTo(e.x + 24, e.y - 12 + wingFlap * 8, e.x + 22, e.y + 6);
-      c.quadraticCurveTo(e.x + 16, e.y + 4, e.x + 12, e.y + 6);
+      c.moveTo(12, -6);
+      c.quadraticCurveTo(24, -12 + wingFlap * 8, 22, 6);
+      c.quadraticCurveTo(16, 4, 12, 6);
       c.fill();
       c.stroke();
 
       // Mandibles — pincers at bottom
       c.beginPath();
-      c.moveTo(e.x - 4, e.y + 14);
-      c.quadraticCurveTo(e.x - 10, e.y + 22, e.x - 6, e.y + 24);
-      c.moveTo(e.x + 4, e.y + 14);
-      c.quadraticCurveTo(e.x + 10, e.y + 22, e.x + 6, e.y + 24);
+      c.moveTo(-4, 14);
+      c.quadraticCurveTo(-10, 22, -6, 24);
+      c.moveTo(4, 14);
+      c.quadraticCurveTo(10, 22, 6, 24);
       c.stroke();
 
       // Antennae — short and thick
       c.beginPath();
-      c.moveTo(e.x - 5, e.y - 14);
-      c.quadraticCurveTo(e.x - 12, e.y - 22, e.x - 8, e.y - 24);
-      c.moveTo(e.x + 5, e.y - 14);
-      c.quadraticCurveTo(e.x + 12, e.y - 22, e.x + 8, e.y - 24);
+      c.moveTo(-5, -14);
+      c.quadraticCurveTo(-12, -22, -8, -24);
+      c.moveTo(5, -14);
+      c.quadraticCurveTo(12, -22, 8, -24);
       c.stroke();
 
       // Eyes — glowing red
       c.fillStyle = '#fff';
       c.beginPath();
-      c.arc(e.x - 5, e.y - 8, 3, 0, Math.PI * 2);
-      c.arc(e.x + 5, e.y - 8, 3, 0, Math.PI * 2);
+      c.arc(-5, -8, 3, 0, Math.PI * 2);
+      c.arc(5, -8, 3, 0, Math.PI * 2);
       c.fill();
 
       // Legs — three pairs, thicker (armored)
       c.lineWidth = 2;
       for (let i = -1; i <= 1; i++) {
-        const ly = e.y + i * 6;
+        const ly = i * 6;
         c.beginPath();
-        c.moveTo(e.x - 12, ly);
-        c.lineTo(e.x - 20, ly - 5);
-        c.lineTo(e.x - 20, ly + 5);
-        c.moveTo(e.x + 12, ly);
-        c.lineTo(e.x + 20, ly - 5);
-        c.lineTo(e.x + 20, ly + 5);
+        c.moveTo(-12, ly);
+        c.lineTo(-20, ly - 5);
+        c.lineTo(-20, ly + 5);
+        c.moveTo(12, ly);
+        c.lineTo(20, ly - 5);
+        c.lineTo(20, ly + 5);
         c.stroke();
       }
       c.lineWidth = 2;
@@ -1166,7 +1466,7 @@ function drawEnemies() {
       const dotR = 2;
       for (let i = 0; i < e.maxHp; i++) {
         c.beginPath();
-        c.arc(e.x - (e.maxHp - 1) * 4 + i * 8, e.y - 26, dotR, 0, Math.PI * 2);
+        c.arc(-(e.maxHp - 1) * 4 + i * 8, -26, dotR, 0, Math.PI * 2);
         c.fillStyle = i < e.hp ? '#fff' : color + '44';
         c.fill();
       }

@@ -109,6 +109,12 @@ const CONFIG = {
     formationStartY: 70,   // Y offset for the top row of the enemy formation
     health: { basic: 1, zigzag: 1, turret: 2 },
     shootChance: { basic: 0.04, zigzag: 0.04, turret: 0.08 },
+    // Per-type glow settings (shadowColor + shadowBlur)
+    glow: {
+      basic:  { color: '#ff4a6d', blur: 1 },
+      zigzag: { color: '#ffcc00', blur: 1 },
+      turret: { color: '#b088f9', blur: 1 }
+    },
     dive: {
       curveRadius: 80,
       diveSpeed: 275,
@@ -1540,8 +1546,10 @@ function drawEnemies() {
     }
     c.translate(e.x, e.y);
     c.rotate(e.rotation || 0);
-    c.shadowColor = color;
-    c.shadowBlur = 8;
+    // Use per-type glow from CONFIG (fallback to defaults)
+    const glow = CONFIG.enemies.glow && CONFIG.enemies.glow[e.type];
+    c.shadowColor = glow ? glow.color : color;
+    c.shadowBlur = glow ? glow.blur : 8;
     c.strokeStyle = color;
     c.lineWidth = 2;
     c.fillStyle = color + '22';
@@ -1551,30 +1559,59 @@ function drawEnemies() {
 
     if (e.type === 'basic') {
       // ---- Beetle / Firefly bug (Galaga-style) ----
-      // Body — vertical oval (scaled ~0.65x)
+      const basicWingColor = '#ff0000';
+      const basicWingStroke = '#cc0000';
+      const basicTorsoColor = '#ffffff';
+      const basicStripeColor = '#4488ff';
+      const basicAntennaColor = '#4488ff';
+
+      // Body — vertical oval, solid white fill
       c.beginPath();
       c.ellipse(0, 0, 5, 8, 0, 0, Math.PI * 2);
+      c.fillStyle = basicTorsoColor;
       c.fill();
+      c.strokeStyle = '#cccccc';
+      c.lineWidth = 1;
       c.stroke();
+      c.lineWidth = 2;
 
-      // Wing membrane — left
+      // Two blue horizontal stripes on torso
+      c.strokeStyle = basicStripeColor;
+      c.lineWidth = 1.5;
+      for (let s = -1; s <= 1; s += 2) {
+        const sy = s * 2.5;
+        const halfW = Math.sqrt(Math.max(0, 25 - (sy * sy) / 64 * 25));
+        c.beginPath();
+        c.moveTo(-Math.min(halfW, 4.5), sy);
+        c.lineTo(Math.min(halfW, 4.5), sy);
+        c.stroke();
+      }
+      c.lineWidth = 2;
+
+      // Wing membrane — left (solid red)
       c.beginPath();
       c.moveTo(-5, -3);
       c.quadraticCurveTo(-13, -5 + wingFlap * 8, -12, 3);
       c.quadraticCurveTo(-8, 1, -5, 3);
-      c.fillStyle = color + '44';
+      c.closePath();
+      c.fillStyle = basicWingColor;
       c.fill();
+      c.strokeStyle = basicWingStroke;
       c.stroke();
 
-      // Wing membrane — right
+      // Wing membrane — right (solid red)
       c.beginPath();
       c.moveTo(5, -3);
       c.quadraticCurveTo(13, -5 + wingFlap * 8, 12, 3);
       c.quadraticCurveTo(8, 1, 5, 3);
+      c.closePath();
+      c.fillStyle = basicWingColor;
       c.fill();
+      c.strokeStyle = basicWingStroke;
       c.stroke();
 
-      // Antennae
+      // Antennae — blue
+      c.strokeStyle = basicAntennaColor;
       c.beginPath();
       c.moveTo(-3, -8);
       c.quadraticCurveTo(-7, -15, -9, -13);
@@ -1590,6 +1627,7 @@ function drawEnemies() {
       c.fill();
 
       // Legs — three pairs
+      c.strokeStyle = color;
       c.lineWidth = 1.2;
       const legSpread = 4;
       for (let i = -1; i <= 1; i++) {
@@ -1607,62 +1645,99 @@ function drawEnemies() {
 
     } else if (e.type === 'zigzag') {
       // ---- Dragonfly / Moth bug ----
-      // Body — elongated oval (scaled ~0.65x)
+      // Blue wings with solid fill
+      const wingColor = '#4488ff';
+      const wingStrokeColor = '#2255cc';
+      // Yellow/red striped torso with solid fill
+      const torsoColor = '#ffcc00';
+      const stripeColor = '#ff3333';
+      const eyeColor = '#ff0000';
+
+      // Body — elongated oval with yellow fill
       c.beginPath();
       c.ellipse(0, 0, 4, 9, 0, 0, Math.PI * 2);
+      c.fillStyle = torsoColor;
       c.fill();
+      c.strokeStyle = '#cc9900';
+      c.lineWidth = 1;
       c.stroke();
+      c.lineWidth = 2;
 
-      // Wings — long and sweeping, left
+      // Red stripes on torso — horizontal bands
+      c.strokeStyle = stripeColor;
+      c.lineWidth = 1.5;
+      for (let s = -2; s <= 2; s++) {
+        const sy = s * 3.5;
+        const halfW = Math.sqrt(Math.max(0, 16 - (sy * sy) / (9 * 9) * 16));
+        c.beginPath();
+        c.moveTo(-Math.min(halfW, 3.5), sy);
+        c.lineTo(Math.min(halfW, 3.5), sy);
+        c.stroke();
+      }
+      c.lineWidth = 2;
+
+      // Wings — long and sweeping, left (solid blue)
       c.beginPath();
       c.moveTo(-4, -4);
       c.quadraticCurveTo(-18, -10 + wingFlap * 10, -17, -1);
       c.quadraticCurveTo(-10, 0, -4, 1);
-      c.fillStyle = color + '55';
+      c.closePath();
+      c.fillStyle = wingColor;
       c.fill();
+      c.strokeStyle = wingStrokeColor;
       c.stroke();
 
-      // Wings — long and sweeping, right
+      // Wings — long and sweeping, right (solid blue)
       c.beginPath();
       c.moveTo(4, -4);
       c.quadraticCurveTo(18, -10 + wingFlap * 10, 17, -1);
       c.quadraticCurveTo(10, 0, 4, 1);
+      c.closePath();
+      c.fillStyle = wingColor;
       c.fill();
+      c.strokeStyle = wingStrokeColor;
       c.stroke();
 
-      // Lower wings — left
+      // Lower wings — left (solid blue)
       c.beginPath();
       c.moveTo(-4, 1);
       c.quadraticCurveTo(-14, 4 + wingFlap * 7, -13, 9);
       c.quadraticCurveTo(-8, 7, -4, 4);
-      c.fillStyle = color + '33';
+      c.closePath();
+      c.fillStyle = wingColor;
       c.fill();
+      c.strokeStyle = wingStrokeColor;
       c.stroke();
 
-      // Lower wings — right
+      // Lower wings — right (solid blue)
       c.beginPath();
       c.moveTo(4, 1);
       c.quadraticCurveTo(14, 4 + wingFlap * 7, 13, 9);
       c.quadraticCurveTo(8, 7, 4, 4);
+      c.closePath();
+      c.fillStyle = wingColor;
       c.fill();
+      c.strokeStyle = wingStrokeColor;
       c.stroke();
 
       // Antennae — curved
       c.beginPath();
+      c.strokeStyle = color;
       c.moveTo(-2, -9);
       c.quadraticCurveTo(-5, -16, -8, -14);
       c.moveTo(2, -9);
       c.quadraticCurveTo(5, -16, 8, -14);
       c.stroke();
 
-      // Eyes — larger, more menacing
-      c.fillStyle = '#fff';
+      // Eyes — red
+      c.fillStyle = eyeColor;
       c.beginPath();
       c.arc(-2, -5, 2, 0, Math.PI * 2);
       c.arc(2, -5, 2, 0, Math.PI * 2);
       c.fill();
 
       // Legs — three pairs, thinner
+      c.strokeStyle = color;
       c.lineWidth = 1.2;
       for (let i = -1; i <= 1; i++) {
         const ly = i * 3;

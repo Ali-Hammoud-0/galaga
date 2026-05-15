@@ -93,7 +93,15 @@ const CONFIG = {
     accent: '#00f0ff'
   },
   player: { speed: 5, lives: 3, maxPlayerBullets: 2, respawnInvuln: 3000, shotCooldown: 200 },
-  bullets: { playerSpeed: 15, enemySpeed: 12, playerRadius: 4, enemyRadius: 5 },
+  bullets: {
+    playerSpeed: 15,
+    enemySpeed: 12,
+    // Bullet line dimensions (pixels)
+    playerLength: 16,
+    playerWidth: 3,
+    enemyLength: 12,
+    enemyWidth: 4
+  },
   enemies: {
     formationSpeed: 0.03,
     diveFrequency: 0.008,
@@ -374,8 +382,12 @@ function clampPlayer() {
 }
 
 // --- Bullet ---
-function createBullet(x, y, vx, vy, type, radius) {
-  return { x, y, vx, vy, type, radius: radius || 4, alive: true };
+function createBullet(x, y, vx, vy, type) {
+  const len = type === 'player' ? CONFIG.bullets.playerLength : CONFIG.bullets.enemyLength;
+  const w = type === 'player' ? CONFIG.bullets.playerWidth : CONFIG.bullets.enemyWidth;
+  // Angle of travel (used to orient the bullet line)
+  const angle = Math.atan2(vy, vx);
+  return { x, y, vx, vy, type, length: len, width: w, angle, alive: true };
 }
 
 // --- Enemy ---
@@ -624,8 +636,7 @@ function updateDivingEnemies() {
           e.x, e.y + 10,
           0,
           speed,
-          'enemy',
-          CONFIG.bullets.enemyRadius
+          'enemy'
         ));
       }
       e.shootTimer = Math.max(10, 30 + Math.random() * 60 - waveManager.wave * 2); // Fire faster at higher waves
@@ -674,8 +685,7 @@ function updateFormationShooting() {
           e.x, e.y + 10,
           0,
           CONFIG.bullets.enemySpeed * Math.min(diffMult, 2.0),
-          'enemy',
-          CONFIG.bullets.enemyRadius
+          'enemy'
         ));
       }
       e.shootTimer = Math.max(20, 60 + Math.random() * 120 - waveManager.wave * 3);
@@ -684,7 +694,7 @@ function updateFormationShooting() {
 }
 
 // ================================================================
-//  COLLISION DETECTION — Circle-based
+//  COLLISION DETECTION
 // ================================================================
 
 /** Check circle-circle overlap */
@@ -692,6 +702,38 @@ function circleCollide(x1, y1, r1, x2, y2, r2) {
   const dx = x1 - x2;
   const dy = y1 - y2;
   return (dx * dx + dy * dy) <= (r1 + r2) * (r1 + r2);
+}
+
+/**
+ * Check if a rotated rectangle (bullet) overlaps a circle (enemy/player).
+ * Uses the separating axis theorem: project the circle onto the
+ * rectangle's local axes and check overlap on each.
+ *
+ * rectX, rectY — center of the bullet rectangle
+ * rectW, rectH — width and height (length and width) of the bullet
+ * angle — rotation of the bullet in radians
+ * circX, circY — center of the circle (enemy or player hit-area)
+ * circR — radius of the circle
+ */
+function rectCircleCollide(rectX, rectY, rectW, rectH, angle, circX, circY, circR) {
+  // Transform circle center into rectangle's local space
+  const cos = Math.cos(-angle);
+  const sin = Math.sin(-angle);
+  const dx = circX - rectX;
+  const dy = circY - rectY;
+  const localX = dx * cos - dy * sin;
+  const localY = dx * sin + dy * cos;
+
+  // Find the closest point on the rectangle to the circle center
+  const halfW = rectW / 2;
+  const halfH = rectH / 2;
+  const closestX = Math.max(-halfW, Math.min(halfW, localX));
+  const closestY = Math.max(-halfH, Math.min(halfH, localY));
+
+  // Distance from closest point to circle center
+  const distX = localX - closestX;
+  const distY = localY - closestY;
+  return (distX * distX + distY * distY) <= circR * circR;
 }
 
 /** Player bounding circle */
@@ -708,7 +750,7 @@ function checkCollisions() {
     enemies.forEach(e => {
       if (!e.alive) return;
       const enemyR = e.type === 'turret' ? 16 : e.type === 'zigzag' ? 14 : 12;
-      if (circleCollide(b.x, b.y, b.radius, e.x, e.y, enemyR)) {
+      if (rectCircleCollide(b.x, b.y, b.length, b.width, b.angle, e.x, e.y, enemyR)) {
         b.alive = false;
         e.hp -= 1;
         AudioSys.play('hit');
@@ -728,7 +770,7 @@ function checkCollisions() {
   if (player.alive && player.invulnTimer <= 0) {
     bullets.forEach(b => {
       if (b.type !== 'enemy' || !b.alive) return;
-      if (circleCollide(b.x, b.y, b.radius, pc.x, pc.y, pc.r)) {
+      if (rectCircleCollide(b.x, b.y, b.length, b.width, b.angle, pc.x, pc.y, pc.r)) {
         b.alive = false;
         playerHit();
       }
@@ -1134,32 +1176,19 @@ function drawEnemies() {
   });
 }
 
-/** Draw bullets */
+/** Draw bullets as oriented line segments */
 function drawBullets() {
   bullets.forEach(b => {
     if (!b.alive) return;
     c.save();
-    if (b.type === 'player') {
-      c.shadowColor = CONFIG.colors.playerBullet;
-      c.shadowBlur = 10;
-      c.fillStyle = CONFIG.colors.playerBullet;
-      c.beginPath();
-      c.arc(b.x, b.y, b.radius, 0, Math.PI * 2);
-      c.fill();
-      // Trail
-      c.shadowBlur = 0;
-      c.globalAlpha = 0.3;
-      c.beginPath();
-      c.ellipse(b.x, b.y + 8, b.radius * 0.6, 8, 0, 0, Math.PI * 2);
-      c.fill();
-    } else {
-      c.shadowColor = CONFIG.colors.enemyBullet;
-      c.shadowBlur = 8;
-      c.fillStyle = CONFIG.colors.enemyBullet;
-      c.beginPath();
-      c.arc(b.x, b.y, b.radius, 0, Math.PI * 2);
-      c.fill();
-    }
+    const color = b.type === 'player' ? CONFIG.colors.playerBullet : CONFIG.colors.enemyBullet;
+    c.shadowColor = color;
+    c.shadowBlur = b.type === 'player' ? 10 : 8;
+    c.fillStyle = color;
+    c.translate(b.x, b.y);
+    c.rotate(b.angle);
+    // Draw the bullet as a thin rectangle centered at origin
+    c.fillRect(-b.length / 2, -b.width / 2, b.length, b.width);
     c.restore();
   });
 }
@@ -1390,8 +1419,7 @@ function gameLoop(timestamp) {
           player.y - player.height / 2,
           0,
           -CONFIG.bullets.playerSpeed,
-          'player',
-          CONFIG.bullets.playerRadius
+          'player'
         ));
         AudioSys.play('shoot');
         lastShotTime = globalTime * 1000;

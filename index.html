@@ -99,19 +99,19 @@ const CONFIG = {
     // Bullet line dimensions (pixels)
     playerLength: 16,
     playerWidth: 3,
-    enemyLength: 12,
+    enemyLength: 16,
     enemyWidth: 4
   },
   enemies: {
     formationSpeed: 0.03,
-    diveFrequency: 0.008,
+    diveFrequency: 0.007,
     returnSpeed: 3,
     health: { basic: 1, zigzag: 2, turret: 3 },
-    shootChance: { basic: 0.02, zigzag: 0.03, turret: 0.08 },
+    shootChance: { basic: 0.04, zigzag: 0.04, turret: 0.08 },
     // Dive path configuration — Galaga-style curved dives with U-turns
     dive: {
       curveRadius: 80,         // radius of U-turn arcs (pixels)
-      diveSpeed: 220,          // travel speed along path (pixels/sec)
+      diveSpeed: 275,          // travel speed along path (pixels/sec)
       diveDepth: 0.88          // how far down the enemy dives (0..1 fraction of canvas height)
     }
   },

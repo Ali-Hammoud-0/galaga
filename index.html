@@ -153,7 +153,9 @@ const AudioSys = (() => {
   /** Play a preloaded sound buffer */
   function play(soundKey) {
     if (!CONFIG.audio.enabled || !ctx) return;
-    const buf = buffers[soundKey];
+    const url = CONFIG.audio[soundKey];
+    if (!url) return;
+    const buf = buffers[url];
     if (!buf) return;
     try {
       const source = ctx.createBufferSource();
@@ -704,7 +706,6 @@ function checkCollisions() {
           e.alive = false;
           score += CONFIG.difficulty.scorePerKill * (e.type === 'turret' ? 3 : e.type === 'zigzag' ? 2 : 1);
           spawnParticles(e.x, e.y, 12);
-          AudioSys.play('explosion');
         } else {
           // Flash effect: small particle burst
           spawnParticles(b.x, b.y, 3);
@@ -732,7 +733,6 @@ function checkCollisions() {
       if (circleCollide(e.x, e.y, enemyR, pc.x, pc.y, pc.r)) {
         e.alive = false;
         spawnParticles(e.x, e.y, 12);
-        AudioSys.play('explosion');
         playerHit();
       }
     });

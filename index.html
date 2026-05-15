@@ -407,7 +407,7 @@ function createEnemy(type, gridX, gridY, formationX, formationY) {
     gridY,
     hp: hpMap[type] || 1,
     maxHp: hpMap[type] || 1,
-    state: 'formation', // 'formation', 'diving'
+    state: 'formation', // 'formation', 'diving', 'wrapping'
     diveTimer: 0,
     divePhase: 0,
     alive: true,
@@ -420,9 +420,11 @@ function createEnemy(type, gridX, gridY, formationX, formationY) {
     diveStartY: formationY,
     diveDirection: (Math.random() < 0.5) ? -1 : 1, // top U-turn direction
     divePath: null, // { segments, totalLength }
-    // For return
+    // For return / wrap
     targetX: formationX,
-    targetY: formationY
+    targetY: formationY,
+    // For wrapping: visibility during wrap animation
+    wrapAlpha: 1
   };
 }
 
@@ -756,6 +758,123 @@ function buildDivePath(enemy) {
   return { segments, totalLength };
 }
 
+/**
+ * Build a dive path for non-zigzag enemies (basic, turret).
+ *
+ * Same as buildDivePath but WITHOUT the bottom U-turn and ascent.
+ * The enemy follows segments 1-5 (top U-turn, straight descent, S-curve,
+ * final descent) but the final line extends all the way off-screen.
+ * When the enemy goes fully off-screen it wraps back at the top.
+ *
+ * Path structure (5 segments):
+ *   1) Top U-turn: semicircle
+ *   2) Straight descent to mid-screen
+ *   3) S-curve arc A
+ *   4) S-curve arc B
+ *   5) Straight descent extended well past bottom of screen
+ */
+function buildDivePathNoReturn(enemy) {
+  const R = CONFIG.enemies.dive.curveRadius;
+  const dir = enemy.diveDirection;
+  const startX = enemy.diveStartX;
+  const startY = enemy.diveStartY;
+
+  const midScreenY = H * 0.45;
+  const midTargetX = Math.max(30, Math.min(W - 30, player.x + (Math.random() - 0.5) * 80));
+
+  // -- Segment 1: Top U-turn --
+  let topArc;
+  if (dir === 1) {
+    const cx = startX + R;
+    const cy = startY;
+    topArc = {
+      type: 'arc', cx, cy, radius: R,
+      startAngle: -Math.PI, endAngle: 0, isCW: true,
+      length: R * Math.PI
+    };
+  } else {
+    const cx = startX - R;
+    const cy = startY;
+    topArc = {
+      type: 'arc', cx, cy, radius: R,
+      startAngle: 0, endAngle: -Math.PI, isCW: false,
+      length: R * Math.PI
+    };
+  }
+  const topExitX = topArc.cx + topArc.radius * Math.cos(topArc.endAngle);
+  const topExitY = topArc.cy + topArc.radius * Math.sin(topArc.endAngle);
+
+  // -- Segment 2: Straight descent to mid-screen --
+  const midDx = midTargetX - topExitX;
+  const midDy = midScreenY - topExitY;
+  const midLength = Math.sqrt(midDx * midDx + midDy * midDy);
+  const midLine = {
+    type: 'line',
+    fromX: topExitX, fromY: topExitY,
+    toX: midTargetX, toY: midScreenY,
+    length: midLength
+  };
+
+  // Recalculate final target at mid-screen
+  const finalTargetX = Math.max(30, Math.min(W - 30, player.x + (Math.random() - 0.5) * 100));
+
+  // -- Segments 3 & 4: Mid-screen S-curve --
+  const midCurveDir = (finalTargetX >= midTargetX) ? 1 : -1;
+
+  let arcA, arcB;
+  if (midCurveDir === 1) {
+    arcA = {
+      type: 'arc',
+      cx: midTargetX + R, cy: midScreenY, radius: R,
+      startAngle: Math.PI, endAngle: Math.PI / 2, isCW: false,
+      length: R * Math.PI / 2,
+      rotationBlend: 0.6
+    };
+    arcB = {
+      type: 'arc',
+      cx: midTargetX + R, cy: midScreenY + 2 * R, radius: R,
+      startAngle: -Math.PI / 2, endAngle: 0, isCW: true,
+      length: R * Math.PI / 2,
+      rotationBlend: 0.6
+    };
+  } else {
+    arcA = {
+      type: 'arc',
+      cx: midTargetX - R, cy: midScreenY, radius: R,
+      startAngle: 0, endAngle: Math.PI / 2, isCW: true,
+      length: R * Math.PI / 2,
+      rotationBlend: 0.6
+    };
+    arcB = {
+      type: 'arc',
+      cx: midTargetX - R, cy: midScreenY + 2 * R, radius: R,
+      startAngle: 3 * Math.PI / 2, endAngle: Math.PI, isCW: false,
+      length: R * Math.PI / 2,
+      rotationBlend: 0.6
+    };
+  }
+  const sCurveExitX = arcB.cx + arcB.radius * Math.cos(arcB.endAngle);
+  const sCurveExitY = arcB.cy + arcB.radius * Math.sin(arcB.endAngle);
+
+  // -- Segment 5: Straight descent extended well off-screen --
+  // Extend the line from S-curve exit through the final target X and
+  // continue past the bottom of the screen with extra padding.
+  const offScreenY = H + 80; // well below visible area
+  const finalDx = finalTargetX - sCurveExitX;
+  const finalDy = offScreenY - sCurveExitY;
+  const finalLength = Math.sqrt(finalDx * finalDx + finalDy * finalDy);
+  const finalLine = {
+    type: 'line',
+    fromX: sCurveExitX, fromY: sCurveExitY,
+    toX: finalTargetX, toY: offScreenY,
+    length: finalLength
+  };
+
+  const segments = [topArc, midLine, arcA, arcB, finalLine];
+  const totalLength = segments.reduce((sum, s) => sum + s.length, 0);
+  return { segments, totalLength };
+}
+
 /** Interpolate between two angles using the shortest angular path. */
 function shortestAngleLerp(a, b, t) {
   let diff = b - a;
@@ -782,7 +901,7 @@ function shortestAngleLerp(a, b, t) {
   * On the final ascent segment, rotation smoothly blends back to 0 (upright)
   * as the enemy nears the formation grid.
   */
-function evaluatePath(path, d) {
+function evaluatePath(path, d, blendUprightOnLast = true) {
   let remaining = d;
   let prevSegment = null;
   const blendZone = 20; // pixels - smooth rotation over this distance at boundaries
@@ -861,7 +980,8 @@ function evaluatePath(path, d) {
 
       // On the last segment (ascent), blend rotation toward 0 (upright)
       // over the last 50% of the segment for a smooth lock-in.
-      if (isLastSegment && t > 0.5) {
+      // Skip this for noReturn paths where the last segment is a descent.
+      if (blendUprightOnLast && isLastSegment && t > 0.5) {
         const blendT = (t - 0.5) / 0.5; // 0..1
         let diff = -rotation;
         while (diff >  Math.PI) diff -= 2 * Math.PI;
@@ -891,6 +1011,10 @@ function evaluatePath(path, d) {
 
 /**
  * Trigger an enemy to dive from formation.
+ * Zigzag (yellow) enemies use the full Galaga-style curved dive with U-turns
+ * and ascent back to formation.
+ * Basic and turret enemies do the same top U-turn + S-curve but skip the
+ * bottom U-turn — they continue straight down off-screen and wrap at top.
  */
 function tryTriggerDive(dt) {
   const formationEnemies = enemies.filter(e => e.alive && e.state === 'formation');
@@ -907,15 +1031,27 @@ function tryTriggerDive(dt) {
     candidate.diveStartY = candidate.y;
     candidate.diveDirection = (Math.random() < 0.5) ? -1 : 1;
     candidate.rotation = 0;
-    candidate.divePath = buildDivePath(candidate);
+
+    if (candidate.type === 'zigzag') {
+      // Full dive path with bottom U-turn and ascent back to formation
+      candidate.noReturn = false;
+      candidate.divePath = buildDivePath(candidate);
+    } else {
+      // Same top U-turn + S-curve, but final line extends off-screen (no return)
+      candidate.noReturn = true;
+      candidate.divePath = buildDivePathNoReturn(candidate);
+    }
   }
 }
 
 /**
  * Update diving enemies along their segment path.
  *
- * The enemy travels at a constant speed along the path. Total duration
- * is computed from the path length and a configured speed.
+ * Zigzag (yellow) enemies follow the full path including bottom U-turn
+ * and ascent back to formation.
+ * Basic and turret enemies follow a path without the bottom U-turn —
+ * when their path is complete they transition to 'wrapping' and
+ * re-enter at the top of the screen.
  */
 function updateDivingEnemies() {
   const diveSpeed = CONFIG.enemies.dive.diveSpeed || 200; // pixels per second
@@ -928,7 +1064,9 @@ function updateDivingEnemies() {
 
     if (!e.divePath) return;
 
-    const pos = evaluatePath(e.divePath, dist);
+    // Pass blendUprightOnLast: only zigzag (return) enemies blend upright on last segment
+    const blendUpright = !e.noReturn;
+    const pos = evaluatePath(e.divePath, dist, blendUpright);
     e.x = pos.x;
     e.y = pos.y;
     e.rotation = pos.rotation;
@@ -950,19 +1088,57 @@ function updateDivingEnemies() {
       e.shootTimer = Math.max(10, 30 + Math.random() * 60 - waveManager.wave * 2);
     }
 
-    // Path complete — transition back to formation
+    // Path complete
     if (dist >= e.divePath.totalLength) {
+      if (e.noReturn) {
+        // Non-zigzag: transition to wrapping — re-enter at top
+        e.state = 'wrapping';
+        e.x = e.targetX; // Snap to target X for re-entry
+        e.y = -30; // Start above visible area
+        e.rotation = 0; // Upright
+        e.wrapAlpha = 0; // Fade in
+        e.wrapTargetY = e.targetY;
+      } else {
+        // Zigzag: return to formation
+        e.state = 'formation';
+        e.rotation = 0;
+        e.x = e.targetX;
+        e.y = e.targetY;
+      }
+    }
+  });
+}
+
+/**
+ * Update wrapping enemies — they slide down from the top of the screen
+ * to their grid formation position, fading in as they approach.
+ */
+function updateWrappingEnemies() {
+  const wrapSpeed = 4; // pixels per frame
+
+  enemies.forEach(e => {
+    if (e.state !== 'wrapping') return;
+
+    // Fade in quickly
+    e.wrapAlpha = Math.min(1, e.wrapAlpha + 0.05);
+
+    // Slide toward target Y
+    const dy = e.wrapTargetY - e.y;
+    if (Math.abs(dy) < wrapSpeed) {
+      // Arrived at formation position
+      e.y = e.wrapTargetY;
       e.state = 'formation';
       e.rotation = 0;
-      e.x = e.targetX;
-      e.y = e.targetY;
+      e.wrapAlpha = 1;
+    } else {
+      e.y += Math.sign(dy) * wrapSpeed;
     }
   });
 }
 
 /**
  * No separate returning phase — the return is part of the dive path
- * (segments 3-4). This function is a no-op now.
+ * (segments 3-4) for zigzag enemies. This function is a no-op.
  */
 function updateReturningEnemies() {
   // Return is handled inline in updateDivingEnemies
@@ -1254,6 +1430,10 @@ function drawEnemies() {
       : CONFIG.colors.enemyTurret;
 
     c.save();
+    // Apply wrap alpha for enemies re-entering from top
+    if (e.state === 'wrapping' && e.wrapAlpha !== undefined) {
+      c.globalAlpha = e.wrapAlpha;
+    }
     c.translate(e.x, e.y);
     c.rotate(e.rotation || 0);
     c.shadowColor = color;
@@ -1743,6 +1923,7 @@ function gameLoop(timestamp) {
   updateFormationPositions();
   tryTriggerDive(dt);
   updateDivingEnemies();
+  updateWrappingEnemies();
   updateReturningEnemies();
   updateFormationShooting();
 

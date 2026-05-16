@@ -165,7 +165,7 @@ const AudioSys = (() => {
   let ctx = null;
   let masterGain = null;
   const buffers = {};
-  // Track active sources for stoppable sounds (idle, dive)
+  // Track active sources for stoppable sounds (idle, dive) — arrays so we can stop all instances
   const activeSources = {};
 
   /** Initialize AudioContext on first user gesture (browser policy) */
@@ -200,13 +200,15 @@ const AudioSys = (() => {
       .catch(() => { buffers[url] = null; return null; }); // Silent fallback
   }
 
-  /** Stop any currently playing source for the given sound key */
+  /** Stop all currently playing sources for the given sound key */
   function stop(soundKey) {
     if (!ctx) return;
-    const src = activeSources[soundKey];
-    if (src) {
-      try { src.stop(); } catch (e) { /* already stopped */ }
-      try { src.disconnect(); } catch (e) { }
+    const sources = activeSources[soundKey];
+    if (sources && sources.length) {
+      sources.forEach(src => {
+        try { src.stop(); } catch (e) { /* already stopped */ }
+        try { src.disconnect(); } catch (e) { }
+      });
       delete activeSources[soundKey];
     }
   }
@@ -228,23 +230,29 @@ const AudioSys = (() => {
   }
 
   /** Play a stoppable sound (only one instance at a time per key).
-   *  Stops any previous instance of the same sound before playing. */
+   *  Stops any previous instances of the same sound before playing. */
   function playStoppable(soundKey) {
     if (!CONFIG.audio.enabled || !ctx || !masterGain) return;
     const url = CONFIG.audio[soundKey];
     if (!url) return;
     const buf = buffers[url];
     if (!buf) return;
-    // Stop any previous instance of this sound first
+    // Stop all previous instances of this sound first
     stop(soundKey);
     try {
       const source = ctx.createBufferSource();
       source.buffer = buf;
       source.connect(masterGain);
       source.start(0);
-      activeSources[soundKey] = source;
-      // Clean up tracking when the sound finishes naturally
-      source.onended = () => { delete activeSources[soundKey]; };
+      // Ensure array exists for this key
+      if (!activeSources[soundKey]) activeSources[soundKey] = [];
+      activeSources[soundKey].push(source);
+      // Clean up this specific source when the sound finishes naturally
+      source.onended = () => {
+        const arr = activeSources[soundKey];
+        const idx = arr.indexOf(source);
+        if (idx !== -1) arr.splice(idx, 1);
+      };
     } catch (e) { /* degrade silently */ }
   }
 

@@ -2,7 +2,10 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="mobile-web-app-capable" content="yes">
 <title>Galaga Clone</title>
 
 <!--
@@ -18,6 +21,8 @@
   ║    - sounds/explosion.wav   (enemy destroyed)            ║
   ║    - sounds/levelup.wav     (wave cleared)               ║
   ║    - sounds/gameover.wav    (game over)                  ║
+  ║    - sounds/dive.wav        (enemy begins diving)        ║
+  ║    - sounds/idle.wav        (no enemies diving)          ║
   ║  Audio gracefully degrades if files are missing.         ║
   ║                                                          ║
   ║  CONFIG TWEAKING:                                        ║
@@ -62,13 +67,16 @@
     -webkit-touch-callout: none;
     -webkit-user-select: none;
     user-select: none;
+    overscroll-behavior: none;
   }
 
   canvas {
     display: block;
     object-fit: contain;
     margin: auto;
-    image-rendering: auto;
+    image-rendering: -webkit-optimize-contrast;
+    -webkit-transform: translateZ(0);
+    transform: translateZ(0);
   }
 </style>
 </head>
@@ -94,13 +102,13 @@ const CONFIG = {
   },
   player: { speed: 5, lives: 3, maxPlayerBullets: 2, respawnInvuln: 3000, shotCooldown: 200 },
   bullets: {
-    playerSpeed: 15,
-    enemySpeed: 12,
+    playerSpeed: 12,
+    enemySpeed: 7,
     // Bullet line dimensions (pixels)
     playerLength: 16,
     playerWidth: 3,
-    enemyLength: 16,
-    enemyWidth: 4
+    enemyLength: 20,
+    enemyWidth: 2
   },
   enemies: {
     formationSpeed: 0.03,
@@ -109,15 +117,9 @@ const CONFIG = {
     formationStartY: 70,   // Y offset for the top row of the enemy formation
     health: { basic: 1, zigzag: 1, turret: 2 },
     shootChance: { basic: 0.04, zigzag: 0.04, turret: 0.08 },
-    // Per-type glow settings (shadowColor + shadowBlur)
-    glow: {
-      basic:  { color: '#ff4a6d', blur: 1 },
-      zigzag: { color: '#ffcc00', blur: 1 },
-      turret: { color: '#b088f9', blur: 1 }
-    },
     dive: {
       curveRadius: 80,
-      diveSpeed: 275,
+      diveSpeed: 180,
       diveDepth: 0.88
     },
     idle: {
@@ -147,6 +149,8 @@ const CONFIG = {
     explosion: 'sounds/explosion.wav',
     levelUp: 'sounds/levelup.wav',
     gameOver: 'sounds/gameover.wav',
+    idle: 'sounds/idle.wav',
+    dive: 'sounds/dive.wav',
     volume: 0.6,
     enabled: true
   },
@@ -159,13 +163,20 @@ const CONFIG = {
 // ================================================================
 const AudioSys = (() => {
   let ctx = null;
+  let masterGain = null;
   const buffers = {};
+  // Track active sources for stoppable sounds (idle, dive)
+  const activeSources = {};
 
   /** Initialize AudioContext on first user gesture (browser policy) */
   function init() {
     if (ctx) return;
     try {
       ctx = new (window.AudioContext || window.webkitAudioContext)();
+      // Shared master gain node reduces per-sound node creation overhead
+      masterGain = ctx.createGain();
+      masterGain.gain.value = CONFIG.audio.volume;
+      masterGain.connect(ctx.destination);
     } catch (e) {
       // Audio not supported — game continues silently
       return;
@@ -178,7 +189,7 @@ const AudioSys = (() => {
     }
   }
 
-  /** Preload a WAV file and cache its decoded buffer */
+  /** Preload an audio file and cache its decoded buffer */
   function preload(url) {
     if (!CONFIG.audio.enabled || !ctx) return Promise.resolve(null);
     if (buffers[url]) return Promise.resolve(buffers[url]);
@@ -189,9 +200,20 @@ const AudioSys = (() => {
       .catch(() => { buffers[url] = null; return null; }); // Silent fallback
   }
 
-  /** Play a preloaded sound buffer */
+  /** Stop any currently playing source for the given sound key */
+  function stop(soundKey) {
+    if (!ctx) return;
+    const src = activeSources[soundKey];
+    if (src) {
+      try { src.stop(); } catch (e) { /* already stopped */ }
+      try { src.disconnect(); } catch (e) { }
+      delete activeSources[soundKey];
+    }
+  }
+
+  /** Play a preloaded sound buffer (one-shot, not tracked) */
   function play(soundKey) {
-    if (!CONFIG.audio.enabled || !ctx) return;
+    if (!CONFIG.audio.enabled || !ctx || !masterGain) return;
     const url = CONFIG.audio[soundKey];
     if (!url) return;
     const buf = buffers[url];
@@ -199,15 +221,34 @@ const AudioSys = (() => {
     try {
       const source = ctx.createBufferSource();
       source.buffer = buf;
-      const gain = ctx.createGain();
-      gain.gain.value = CONFIG.audio.volume;
-      source.connect(gain);
-      gain.connect(ctx.destination);
+      // Connect directly to shared master gain (no per-sound gain node)
+      source.connect(masterGain);
       source.start(0);
     } catch (e) { /* degrade silently */ }
   }
 
-  return { init, preload, play };
+  /** Play a stoppable sound (only one instance at a time per key).
+   *  Stops any previous instance of the same sound before playing. */
+  function playStoppable(soundKey) {
+    if (!CONFIG.audio.enabled || !ctx || !masterGain) return;
+    const url = CONFIG.audio[soundKey];
+    if (!url) return;
+    const buf = buffers[url];
+    if (!buf) return;
+    // Stop any previous instance of this sound first
+    stop(soundKey);
+    try {
+      const source = ctx.createBufferSource();
+      source.buffer = buf;
+      source.connect(masterGain);
+      source.start(0);
+      activeSources[soundKey] = source;
+      // Clean up tracking when the sound finishes naturally
+      source.onended = () => { delete activeSources[soundKey]; };
+    } catch (e) { /* degrade silently */ }
+  }
+
+  return { init, preload, play, stop, playStoppable };
 })();
 
 // ================================================================
@@ -233,14 +274,22 @@ function resizeCanvas() {
 window.addEventListener('resize', resizeCanvas);
 resizeCanvas();
 
-/** Convert screen/touch coordinates to canvas logical coordinates */
+/** Cached canvas rect for touch coordinate conversion (avoids layout thrashing on mobile) */
+let cachedCanvasRect = null;
+function updateCanvasRect() {
+  cachedCanvasRect = canvas.getBoundingClientRect();
+}
+window.addEventListener('resize', () => { updateCanvasRect(); resizeCanvas(); });
+updateCanvasRect();
+
+/** Convert screen/touch coordinates to canvas logical coordinates (uses cached rect) */
 function toCanvasX(clientX) {
-  const rect = canvas.getBoundingClientRect();
-  return ((clientX - rect.left) / rect.width) * W;
+  const r = cachedCanvasRect;
+  return ((clientX - r.left) / r.width) * W;
 }
 function toCanvasY(clientY) {
-  const rect = canvas.getBoundingClientRect();
-  return ((clientY - rect.top) / rect.height) * H;
+  const r = cachedCanvasRect;
+  return ((clientY - r.top) / r.height) * H;
 }
 
 // ================================================================
@@ -382,6 +431,10 @@ let lastTime = 0;
 let globalTime = 0;
 let lastShotTime = 0;
 
+// Dive/idle sound state tracking
+let idleSoundPlaying = false;  // whether idle.wav is currently playing
+let idleSoundReady = false;    // whether we're in a state where idle should play (all dives done)
+
 // Idle animation state
 let idleMode = 'swaying'; // 'swaying' or 'breathing'
 let idleCycleCount = 0;   // how many cycles completed in current mode
@@ -395,7 +448,7 @@ function createPlayer() {
   return {
     x: W / 2,
     y: H - 80,
-    width: 22,
+    width: 27,
     height: 26,
     lives: CONFIG.player.lives,
     invulnTimer: 0,
@@ -525,9 +578,9 @@ function spawnWave(wm) {
       const fx = rowStartX + col * spacingX;
       const fy = startY + r * spacingY;
       const enemy = createEnemy(row.type, col, r, fx, fy, row.count);
-      // Scale HP with difficulty
-      enemy.hp = Math.ceil(enemy.hp * difficulty);
-      enemy.maxHp = enemy.hp;
+    //   // Scale HP with difficulty
+    //   enemy.hp = Math.ceil(enemy.hp * difficulty);
+    //   enemy.maxHp = enemy.hp;
       enemies.push(enemy);
     }
   });
@@ -1137,6 +1190,11 @@ function tryTriggerDive(dt) {
   if (Math.random() < diveChance) {
     candidate.state = 'diving';
     candidate.diveStartTime = globalTime;
+    // Play dive sound and stop idle sound when an enemy begins diving
+    AudioSys.stop('idle');
+    idleSoundPlaying = false;
+    idleSoundReady = false;
+    AudioSys.playStoppable('dive');
     candidate.diveStartX = candidate.x;
     candidate.diveStartY = candidate.y;
     candidate.diveDirection = (Math.random() < 0.5) ? -1 : 1;
@@ -1217,6 +1275,14 @@ function updateDivingEnemies() {
       }
     }
   });
+
+  // Check if all dives are complete — if so, play idle sound
+  const divingEnemies = enemies.filter(e => e.alive && e.state === 'diving');
+  if (divingEnemies.length === 0 && !idleSoundPlaying && gameState === STATE.PLAYING) {
+    idleSoundReady = true;
+    idleSoundPlaying = true;
+    AudioSys.playStoppable('idle');
+  }
 }
 
 /**
@@ -1328,11 +1394,16 @@ function playerCircle() {
 function checkCollisions() {
   const pc = playerCircle();
 
-  // Player bullets vs enemies
+  // Player bullets vs enemies — with bounding-box early exit
   bullets.forEach(b => {
     if (b.type !== 'player' || !b.alive) return;
     enemies.forEach(e => {
       if (!e.alive) return;
+      // Quick AABB check before expensive rotated-rect collision
+      const dx = b.x - e.x;
+      const dy = b.y - e.y;
+      const maxDist = Math.max(b.length, e.type === 'turret' ? 12 : e.type === 'zigzag' ? 11 : 10) + 15;
+      if (Math.abs(dx) > maxDist || Math.abs(dy) > maxDist) return;
       const enemyR = e.type === 'turret' ? 12 : e.type === 'zigzag' ? 11 : 10;
       if (rectCircleCollide(b.x, b.y, b.length, b.width, b.angle, e.x, e.y, enemyR)) {
         b.alive = false;
@@ -1343,17 +1414,19 @@ function checkCollisions() {
           score += CONFIG.difficulty.scorePerKill * (e.type === 'turret' ? 3 : e.type === 'zigzag' ? 2 : 1);
           spawnParticles(e.x, e.y, 12);
         } else {
-          // Flash effect: small particle burst
           spawnParticles(b.x, b.y, 3);
         }
       }
     });
   });
 
-  // Enemy bullets vs player
+  // Enemy bullets vs player — with bounding-box early exit
   if (player.alive && player.invulnTimer <= 0) {
     bullets.forEach(b => {
       if (b.type !== 'enemy' || !b.alive) return;
+      const dx = b.x - pc.x;
+      const dy = b.y - pc.y;
+      if (Math.abs(dx) > 20 || Math.abs(dy) > 20) return;
       if (rectCircleCollide(b.x, b.y, b.length, b.width, b.angle, pc.x, pc.y, pc.r)) {
         b.alive = false;
         playerHit();
@@ -1361,10 +1434,13 @@ function checkCollisions() {
     });
   }
 
-  // Enemies vs player (body collision)
+  // Enemies vs player (body collision) — with bounding-box early exit
   if (player.alive && player.invulnTimer <= 0) {
     enemies.forEach(e => {
       if (!e.alive) return;
+      const dx = e.x - pc.x;
+      const dy = e.y - pc.y;
+      if (Math.abs(dx) > 25 || Math.abs(dy) > 25) return;
       const enemyR = e.type === 'turret' ? 12 : e.type === 'zigzag' ? 11 : 10;
       if (circleCollide(e.x, e.y, enemyR, pc.x, pc.y, pc.r)) {
         e.alive = false;
@@ -1469,69 +1545,81 @@ function updateStars() {
   }
 }
 
-/** Draw the starfield background */
+/** Draw the starfield background — optimized for mobile (no per-star save/restore or shadowBlur) */
 function drawBackground() {
   c.fillStyle = CONFIG.colors.bg;
   c.fillRect(0, 0, W, H);
 
-  // Draw each star as a small glowing dot with independent flicker
+  // Draw stars as simple filled rects instead of arcs for performance
+  c.fillStyle = '#ffffff';
   for (let i = 0; i < stars.length; i++) {
     const s = stars[i];
-    // Natural flicker: sine wave modulates alpha around baseAlpha
-    const flicker = Math.sin(s.phase) * 0.5 + 0.5; // 0..1
-    const alpha = s.baseAlpha * (0.4 + flicker * 0.6);
-    c.save();
-    c.globalAlpha = Math.max(0.05, Math.min(1, alpha));
-    c.fillStyle = '#ffffff';
-    c.shadowColor = '#ffffff';
-    c.shadowBlur = s.size * 2;
-    c.beginPath();
-    c.arc(s.x, s.y, s.size, 0, Math.PI * 2);
-    c.fill();
-    c.restore();
+    const flicker = Math.sin(s.phase) * 0.5 + 0.5;
+    c.globalAlpha = Math.max(0.05, s.baseAlpha * (0.4 + flicker * 0.6));
+    c.fillRect(s.x - s.size, s.y - s.size, s.size * 2, s.size * 2);
   }
+  c.globalAlpha = 1;
 }
 
-/** Draw player — sleek upward triangle with engine glow */
+/** Draw player — optimized (no shadowBlur, minimal state changes) */
 function drawPlayer() {
   if (!player.alive) return;
-  // Flicker during invulnerability
   if (player.invulnTimer > 0 && Math.floor(player.invulnTimer / 100) % 2 === 0) return;
 
   const px = player.x;
   const py = player.y;
-  const color = CONFIG.colors.player;
+  const w = player.width;
+  const h = player.height;
 
-  c.save();
-  c.shadowColor = color;
-  c.shadowBlur = 15;
-
-  // Triangle body
+  // Main ship body — solid white triangle
   c.beginPath();
-  c.moveTo(px, py - player.height / 2);
-  c.lineTo(px - player.width / 2, py + player.height / 2);
-  c.lineTo(px + player.width / 2, py + player.height / 2);
+  c.moveTo(px, py - h / 2);           // nose (top center)
+  c.lineTo(px - w / 2, py + h / 2);  // bottom left
+  c.lineTo(px + w / 2, py + h / 2);  // bottom right
   c.closePath();
-  c.strokeStyle = color;
-  c.lineWidth = 2;
-  c.stroke();
-
-  // Inner fill with slight transparency
-  c.fillStyle = color + '33';
+  c.fillStyle = '#ffffff';
   c.fill();
 
-  // Engine glow — small ellipse at bottom
-  c.shadowBlur = 25;
-  c.shadowColor = color;
+  // Red accent — center line from nose to base
+//   c.beginPath();
+//   c.moveTo(px, py - h / 2);
+//   c.lineTo(px, py + h / 2);
+//   c.strokeStyle = '#ff0000';
+//   c.lineWidth = 2;
+//   c.stroke();
+
+  // Red accent — wing tips (small red triangles at bottom corners)
+  const tipSize = 5;
+  // Left wing tip
   c.beginPath();
-  c.ellipse(px, py + player.height / 2 + 4, 4, 8 + Math.sin(globalTime * 10) * 3, 0, 0, Math.PI * 2);
-  c.fillStyle = color + '66';
+  c.moveTo(px - w / 2, py + h / 2);
+  c.lineTo(px - 7 * w / 12 + tipSize, py + h / 2 - 4 * tipSize);
+  c.lineTo(px - w / 2 + tipSize, py + h / 2);
+  c.closePath();
+  c.fillStyle = '#ffffff';
   c.fill();
 
-  c.restore();
+  // Right wing tip
+  c.beginPath();
+  c.moveTo(px + w / 2, py + h / 2);
+  c.lineTo(px + 7 * w / 12 - tipSize, py + h / 2 - 4 * tipSize);
+  c.lineTo(px + w / 2 - tipSize, py + h / 2);
+  c.closePath();
+  c.fillStyle = '#ffffff';
+  c.fill();
+
+  // Red accents
+  c.beginPath();
+  c.moveTo(px, py - h / 4 + 4);
+  c.lineTo(px - 2, py - h / 5 + 10);
+  c.lineTo(px + 2, py - h / 5 + 10);
+  c.closePath();
+  c.fillStyle = '#ff0000';
+  c.fill();
+
 }
 
-/** Draw enemies with distinct geometric silhouettes */
+/** Draw enemies — optimized (no shadowBlur per enemy for mobile performance) */
 function drawEnemies() {
   enemies.forEach(e => {
     if (!e.alive) return;
@@ -1540,17 +1628,12 @@ function drawEnemies() {
       : CONFIG.colors.enemyTurret;
 
     c.save();
-    // Apply wrap alpha for enemies re-entering from top
     if (e.state === 'wrapping' && e.wrapAlpha !== undefined) {
       c.globalAlpha = e.wrapAlpha;
     }
     c.translate(e.x, e.y);
-    // Turret enemies are flipped 180 degrees; others keep original orientation
     c.rotate((e.rotation || 0) + (e.type === 'turret' ? Math.PI : 0));
-    // Use per-type glow from CONFIG (fallback to defaults)
-    const glow = CONFIG.enemies.glow && CONFIG.enemies.glow[e.type];
-    c.shadowColor = glow ? glow.color : color;
-    c.shadowBlur = glow ? glow.blur : 8;
+    // Removed shadowBlur for mobile — solid colors are fast and look sharp
     c.strokeStyle = color;
     c.lineWidth = 2;
     c.fillStyle = color + '22';
@@ -1839,38 +1922,35 @@ function drawEnemies() {
   });
 }
 
-/** Draw bullets as oriented line segments */
+/** Draw bullets — optimized (no shadowBlur, batched by type) */
 function drawBullets() {
+  // Batch player and enemy bullets separately to minimize state changes
+  const playerColor = CONFIG.colors.playerBullet;
+  const enemyColor = CONFIG.colors.enemyBullet;
+
   bullets.forEach(b => {
     if (!b.alive) return;
     c.save();
-    const color = b.type === 'player' ? CONFIG.colors.playerBullet : CONFIG.colors.enemyBullet;
-    c.shadowColor = color;
-    c.shadowBlur = b.type === 'player' ? 10 : 8;
-    c.fillStyle = color;
+    c.fillStyle = b.type === 'player' ? playerColor : enemyColor;
     c.translate(b.x, b.y);
     c.rotate(b.angle);
-    // Draw the bullet as a thin rectangle centered at origin
     c.fillRect(-b.length / 2, -b.width / 2, b.length, b.width);
     c.restore();
   });
 }
 
-/** Draw particles */
+/** Draw particles — optimized (no shadowBlur, minimal state changes) */
 function drawParticles() {
   if (!CONFIG.toggles.particles) return;
   particles.forEach(p => {
     if (!p.alive) return;
     const alpha = Math.max(0, p.life / p.maxLife);
-    c.save();
     c.globalAlpha = alpha;
     c.fillStyle = p.color;
-    c.shadowColor = p.color;
-    c.shadowBlur = 4;
     const size = p.size * alpha;
     c.fillRect(p.x - size / 2, p.y - size / 2, size, size);
-    c.restore();
   });
+  c.globalAlpha = 1;
 }
 
 /** Draw HUD — score, lives, wave */
@@ -1879,8 +1959,7 @@ function drawHUD() {
   c.fillStyle = CONFIG.colors.accent;
   c.font = 'bold 16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
   c.textAlign = 'left';
-  c.shadowColor = CONFIG.colors.accent;
-  c.shadowBlur = 6;
+  // Removed shadowBlur for mobile performance
 
   c.fillText(`SCORE ${score}`, 16, 30);
   c.textAlign = 'right';
@@ -1919,11 +1998,8 @@ function drawMenu() {
   // Title
   c.fillStyle = CONFIG.colors.accent;
   c.font = 'bold 48px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-  c.shadowColor = CONFIG.colors.accent;
-  c.shadowBlur = 20;
   c.fillText('GALAGA', W / 2, H * 0.3);
 
-  c.shadowBlur = 0;
   c.font = '18px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
   c.fillStyle = '#888';
   c.fillText('Press SPACE or tap to start', W / 2, H * 0.5);
@@ -1952,11 +2028,8 @@ function drawPaused() {
   c.textAlign = 'center';
   c.fillStyle = CONFIG.colors.accent;
   c.font = 'bold 36px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-  c.shadowColor = CONFIG.colors.accent;
-  c.shadowBlur = 15;
   c.fillText('PAUSED', W / 2, H / 2);
 
-  c.shadowBlur = 0;
   c.font = '16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
   c.fillStyle = '#888';
   c.fillText('Press P or ESC to resume', W / 2, H / 2 + 40);
@@ -1980,11 +2053,8 @@ function drawGameOver() {
   c.textAlign = 'center';
   c.fillStyle = CONFIG.colors.enemyBasic;
   c.font = 'bold 42px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-  c.shadowColor = CONFIG.colors.enemyBasic;
-  c.shadowBlur = 20;
   c.fillText('GAME OVER', W / 2, H * 0.35);
 
-  c.shadowBlur = 0;
   c.fillStyle = CONFIG.colors.accent;
   c.font = 'bold 24px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
   c.fillText(`Score: ${score}`, W / 2, H * 0.5);
@@ -2021,6 +2091,11 @@ function startGame() {
   spawnWave(waveManager);
   globalTime = 0;
   lastShotTime = 0;
+  // Reset dive/idle sound state
+  idleSoundPlaying = false;
+  idleSoundReady = false;
+  AudioSys.stop('idle');
+  AudioSys.stop('dive');
 }
 
 // ================================================================
